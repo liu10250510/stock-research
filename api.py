@@ -375,8 +375,13 @@ def download_report(job_id: str):
 
 _DIST = _HERE / "ui" / "dist"
 if _DIST.exists():
+    # Mount assets before the catch-all so JS/CSS are served correctly
     app.mount("/assets", StaticFiles(directory=str(_DIST / "assets")), name="assets")
 
+    @app.get("/", include_in_schema=False)
+    def _spa_root():
+        return FileResponse(str(_DIST / "index.html"))
+
     @app.get("/{full_path:path}", include_in_schema=False)
-    def _spa_fallback(full_path: str = ""):
+    def _spa_fallback(full_path: str):
         return FileResponse(str(_DIST / "index.html"))
