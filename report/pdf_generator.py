@@ -983,7 +983,7 @@ def generate_pdf(
     _page_allocation(story, picks, rec_result, ticker_data)
     _page_scenarios(story, scenario_result)
 
-    for pick in picks[:5]:
+    for pick in picks:
         _page_ticker(story, pick, ticker_data)
 
     _page_universe(story, all_scores, risk_metrics, user_risk)
