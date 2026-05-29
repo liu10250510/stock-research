@@ -37,7 +37,7 @@ logs/
 .env
 
 # claude files
-CLAUD.md
+CLAUDE.md
 SPEC.md
 
 
