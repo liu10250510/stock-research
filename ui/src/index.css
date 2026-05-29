@@ -1,0 +1,42 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    background-color: #F0F4F8;
+    color: #1A2332;
+    @apply antialiased;
+  }
+}
+
+/* Custom range slider */
+input[type='range'] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 6px;
+  border-radius: 6px;
+  outline: none;
+  cursor: pointer;
+}
+
+input[type='range']::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #ffffff;
+  border: 3px solid #0EA472;
+  box-shadow: 0 2px 8px rgba(14, 164, 114, 0.35);
+  cursor: pointer;
+}
+
+input[type='range']::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #ffffff;
+  border: 3px solid #0EA472;
+  box-shadow: 0 2px 8px rgba(14, 164, 114, 0.35);
+  cursor: pointer;
+}
