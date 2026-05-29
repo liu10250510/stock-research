@@ -25,6 +25,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
 
 # ---------------------------------------------------------------------------
@@ -366,3 +367,16 @@ def download_report(job_id: str):
         media_type="application/pdf",
         filename=report_path.name,
     )
+
+
+# ---------------------------------------------------------------------------
+# Serve React frontend (production build)
+# ---------------------------------------------------------------------------
+
+_DIST = _HERE / "ui" / "dist"
+if _DIST.exists():
+    app.mount("/assets", StaticFiles(directory=str(_DIST / "assets")), name="assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def _spa_fallback(full_path: str = ""):
+        return FileResponse(str(_DIST / "index.html"))
