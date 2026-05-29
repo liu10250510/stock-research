@@ -122,14 +122,23 @@ def compute_costs(
 # ---------------------------------------------------------------------------
 
 def _stock_fundamentals(ticker_data: dict, info: dict, beta, symbol: str) -> dict:
-    income_stmt  = ticker_data.get("income_stmt")
+    income_stmt   = ticker_data.get("income_stmt")
     balance_sheet = ticker_data.get("balance_sheet")
-    dividends    = ticker_data.get("dividends")
+    dividends     = ticker_data.get("dividends")
 
     name   = info.get("longName") or DISPLAY_NAMES.get(symbol, symbol)
     sector = info.get("sector")   or SECTOR_MAP.get(symbol)
 
-    revenue, revenue_growth, net_income = _income_fields(income_stmt)
+    # Prefer direct info fields (TTM, matches Yahoo Finance) with income_stmt fallback
+    revenue        = info.get("totalRevenue")
+    net_income     = info.get("netIncomeToCommon")
+    revenue_growth = info.get("revenueGrowth")   # already a decimal (e.g. 0.166)
+    if revenue is None or net_income is None:
+        rev_fb, rg_fb, ni_fb = _income_fields(income_stmt)
+        if revenue is None:        revenue        = rev_fb
+        if net_income is None:     net_income     = ni_fb
+        if revenue_growth is None: revenue_growth = rg_fb
+
     total_assets = _balance_sheet_field(balance_sheet, "Total Assets")
     dividend_history = _dividend_history_annual(dividends, years=5)
     annual_div_per_share = _annual_div_per_share(info, dividends)

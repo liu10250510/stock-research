@@ -689,7 +689,8 @@ def _page_ticker(story: list, pick: dict, ticker_data: dict):
 
     # ── Returns + risk metrics ───────────────────────────────────────────────
     story.append(_subsection("Returns & Risk-Adjusted Metrics"))
-    ret_rows = [["Period", "Return"], ["1 Month", _pct(t.get("return_1m"))],
+    ret_rows = [["Period", "Total Return (incl. dividends)"],
+                ["1 Month", _pct(t.get("return_1m"))],
                 ["3 Month", _pct(t.get("return_3m"))], ["1 Year", _pct(t.get("return_1y"))],
                 ["3 Year",  _pct(t.get("return_3y"))], ["5 Year", _pct(t.get("return_5y"))]]
     met_rows = [["Metric", "Value"],
