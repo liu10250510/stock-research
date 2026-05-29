@@ -116,7 +116,7 @@ class DataFetcher:
             ticker = yf.Ticker(symbol)
 
             # ── Always fetched ──────────────────────────────────────────
-            history = ticker.history(period="5y")
+            history = ticker.history(period="2y")
             if history.empty:
                 logger.warning("Skipping %s — empty price history.", symbol)
                 return None

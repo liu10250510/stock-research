@@ -115,6 +115,15 @@ def _run_pipeline(tickers: list, args, log, t0: float) -> None:
 
     _step(f"  ✓ Scored {len(fetched)} tickers.")
 
+    # Free large DataFrames now that analysis is complete; trim history to 1yr
+    for sym in fetched:
+        d = raw[sym]
+        for key in ("balance_sheet", "income_stmt", "cashflow",
+                    "recommendations", "upgrades_downgrades", "funds_data"):
+            d.pop(key, None)
+        if d.get("history") is not None and not d["history"].empty:
+            d["history"] = d["history"].tail(252)
+
     # ── 4. Web research (sentiment + risk factors) ───────────────────────────
     _step("Running web research (sentiment & risk factors)…")
     _NEUTRAL_SENTIMENT = {

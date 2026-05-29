@@ -71,7 +71,7 @@ plt.rcParams.update({
 
 def _fig_to_bytes(fig) -> io.BytesIO:
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
+    fig.savefig(buf, format="png", dpi=80, bbox_inches="tight")
     plt.close(fig)
     buf.seek(0)
     return buf

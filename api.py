@@ -76,7 +76,7 @@ class JobRequest(BaseModel):
     risk: int
     amount: int = 50_000
     platform: str = "questrade"
-    universe_size: int = 30
+    universe_size: int = 20
     sectors: Optional[list[str]] = None
     include: Optional[list[str]] = None
     exclude: Optional[list[str]] = None
