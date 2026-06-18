@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import type { JobStatus } from '../types'
 
-const MAX_RECONNECTS = 10
-const RECONNECT_DELAY_MS = 2000
+const MAX_RECONNECTS = 60
+const RECONNECT_DELAY_MS = 3000
 
 export function useJobStream(jobId: string | null) {
   const [lines, setLines] = useState<string[]>([])
@@ -31,6 +31,9 @@ export function useJobStream(jobId: string | null) {
 
       es.onmessage = (evt: MessageEvent<string>) => {
         const data = evt.data
+
+        // Successful message — reset reconnect counter
+        reconnectsRef.current = 0
 
         if (data === '[DONE]') {
           setStatus('done')

@@ -1,0 +1,24 @@
+app = 'stock-research-lucy'
+primary_region = 'iad'
+
+[build]
+
+[env]
+  REPORTS_DIR = "/data/reports"
+
+[mounts]
+  source = "stock_research_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ['app']
+
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1

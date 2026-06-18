@@ -85,6 +85,34 @@ class DataFetcher:
             logger.warning("Failed to fetch %s: %s", symbol, exc)
             return None
 
+    def resolve_symbols(self, symbols: list[str]) -> dict[str, str]:
+        """Resolve symbols that may be missing the TSX '.TO' suffix.
+
+        For each symbol that fails to fetch, retries with '.TO' appended.
+        Returns a mapping of {original_symbol: resolved_symbol} for every
+        symbol that could be resolved (either form). Symbols that fail both
+        variants are omitted from the result.
+        """
+        resolved: dict[str, str] = {}
+        for sym in symbols:
+            data = self._fetch_one(sym)
+            if data is not None:
+                resolved[sym] = sym
+                continue
+            # Try with .TO suffix (common for TSX-listed Canadian securities)
+            if not sym.endswith(".TO"):
+                candidate = sym + ".TO"
+                try:
+                    data = self._fetch_one(candidate)
+                    if data is not None:
+                        logger.info("Resolved %s → %s", sym, candidate)
+                        resolved[sym] = candidate
+                        continue
+                except Exception:
+                    pass
+            logger.warning("Could not resolve symbol: %s (tried with/without .TO)", sym)
+        return resolved
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------

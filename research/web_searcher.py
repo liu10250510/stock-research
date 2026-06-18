@@ -31,6 +31,11 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
+try:
+    import cache as _cache
+except ImportError:
+    _cache = None  # type: ignore[assignment]
+
 # ---------------------------------------------------------------------------
 # Site clusters
 # ---------------------------------------------------------------------------
@@ -213,17 +218,33 @@ def _build_queries(symbol: str, name: str) -> list:
 # ---------------------------------------------------------------------------
 
 def _run_query(query: str) -> list:
-    """Try DDGS first, fall back to HTTP scraping. Returns list of {body, href} dicts."""
+    """Return search results for query, using cache when available.
+
+    Cache hit → return immediately (stable across runs within 24 h).
+    Cache miss → try DDGS, fall back to HTTP, then persist the result.
+    """
+    if _cache is not None:
+        cached = _cache.get(query)
+        if cached is not None:
+            logger.debug("Cache hit for query: %s", query[:60])
+            return cached
+
+    results: list = []
     try:
-        return _search_ddgs(query)
+        results = _search_ddgs(query)
     except Exception as exc:
         logger.debug("DDGS failed (%s); trying HTTP fallback.", exc)
 
-    try:
-        return _search_http(query)
-    except Exception as exc:
-        logger.warning("Both search methods failed for query: %s — %s", query[:60], exc)
-        return []
+    if not results:
+        try:
+            results = _search_http(query)
+        except Exception as exc:
+            logger.warning("Both search methods failed for query: %s — %s", query[:60], exc)
+
+    if results and _cache is not None:
+        _cache.put(query, results)
+
+    return results
 
 
 def _search_ddgs(query: str) -> list:

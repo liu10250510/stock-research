@@ -23,6 +23,11 @@ import time
 
 logger = logging.getLogger(__name__)
 
+try:
+    import cache as _cache
+except ImportError:
+    _cache = None  # type: ignore[assignment]
+
 # ---------------------------------------------------------------------------
 # §12.2  Sector sensitivity matrix
 # Tuple order: (rates_rising, rates_falling, high_inflation, recession)
@@ -152,31 +157,44 @@ def _run_macro_searches() -> list:
 
 
 def _ddg_search(query: str) -> list:
-    """Run one DDG query; return up to 3 snippet strings. Never raises."""
+    """Run one DDG query with caching; return up to 3 snippet strings. Never raises."""
+    if _cache is not None:
+        cached = _cache.get(query)
+        if cached is not None:
+            logger.debug("Cache hit for macro query: %s", query[:60])
+            return cached
+
+    snippets: list = []
+
     # Preferred: ddgs package (stable, no HTML parsing)
     try:
         from ddgs import DDGS
         results = list(DDGS().text(query, max_results=3))
-        return [r.get("body", "") for r in results if r.get("body")]
+        snippets = [r.get("body", "") for r in results if r.get("body")]
     except Exception:
         pass
 
     # Fallback: HTML scraping
-    try:
-        import requests
-        from bs4 import BeautifulSoup
-        url = "https://html.duckduckgo.com/html/"
-        resp = requests.get(
-            url,
-            params={"q": query},
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=10,
-        )
-        soup = BeautifulSoup(resp.text, "html.parser")
-        return [el.get_text() for el in soup.select("a.result__snippet")][:3]
-    except Exception as exc:
-        logger.warning("macro DDG fallback failed: %s", exc)
-        return []
+    if not snippets:
+        try:
+            import requests
+            from bs4 import BeautifulSoup
+            url = "https://html.duckduckgo.com/html/"
+            resp = requests.get(
+                url,
+                params={"q": query},
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=10,
+            )
+            soup = BeautifulSoup(resp.text, "html.parser")
+            snippets = [el.get_text() for el in soup.select("a.result__snippet")][:3]
+        except Exception as exc:
+            logger.warning("macro DDG fallback failed: %s", exc)
+
+    if snippets and _cache is not None:
+        _cache.put(query, snippets)
+
+    return snippets
 
 
 def _classify_rate_environment(text: str) -> str:

@@ -68,7 +68,7 @@ def _validate(args):
 # Shared pipeline (steps 2–8): fetch → analyse → research → recommend → PDF
 # ---------------------------------------------------------------------------
 
-def _run_pipeline(tickers: list, args, log, t0: float) -> None:
+def _run_pipeline(tickers: list, args, log, t0: float, custom_mode: bool = False) -> None:
     """Execute steps 2–8 given a resolved ticker list."""
 
     def _step(msg: str):
@@ -79,7 +79,22 @@ def _run_pipeline(tickers: list, args, log, t0: float) -> None:
     from data.fetcher import DataFetcher
     fetcher  = DataFetcher()
     spy_hist = fetcher.spy_history
-    raw      = fetcher.fetch_all(tickers)
+
+    if custom_mode:
+        # Resolve symbols: retry with .TO suffix for TSX-listed tickers
+        resolution = fetcher.resolve_symbols(tickers)
+        resolved_tickers = []
+        for orig in tickers:
+            resolved = resolution.get(orig)
+            if resolved is None:
+                log(f"         ⚠ Could not fetch '{orig}' — skipped (try adding .TO for TSX stocks)")
+            else:
+                if resolved != orig:
+                    log(f"         ℹ Resolved '{orig}' → '{resolved}'")
+                resolved_tickers.append(resolved)
+        tickers = resolved_tickers
+
+    raw = fetcher.fetch_all(tickers)
 
     fetched = [s for s, d in raw.items()
                if d.get("history") is not None and not d["history"].empty]
@@ -165,6 +180,7 @@ def _run_pipeline(tickers: list, args, log, t0: float) -> None:
         user_risk=args.risk,
         amount=args.amount,
         platform=args.platform,
+        custom_mode=custom_mode,
     )
     picks = rec_result["picks"]
     if not picks:
@@ -249,7 +265,7 @@ def run_custom(symbols: list, args, log=print) -> None:
     log(f"  Output      : {args.output}")
     log("")
 
-    _run_pipeline(tickers, args, log, t0)
+    _run_pipeline(tickers, args, log, t0, custom_mode=True)
 
     log(f"\n  Done in {time.time() - t0:.1f}s  →  {args.output}\n")
 

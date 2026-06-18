@@ -36,6 +36,9 @@ logs/
 # Environment variables
 .env
 
+# Search result cache (24-hour TTL, reproducibility aid)
+.search_cache/
+
 # claude files
 CLAUDE.md
 SPEC.md

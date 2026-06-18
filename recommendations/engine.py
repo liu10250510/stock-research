@@ -76,19 +76,30 @@ def recommend(
     user_risk: int,
     amount: int = 50_000,
     platform: str = "questrade",
+    custom_mode: bool = False,
 ) -> dict:
     """Run the full recommendation pipeline; return §13.5 + §13.6 output dict.
 
     Never raises. Returns empty picks if no tickers pass risk band filtering.
+
+    When custom_mode=True (user-supplied symbol list), diversification caps and
+    correlation/currency filters are skipped so that all supplied tickers that
+    can be scored are returned, ranked by quality.
     """
-    # §13.1 — Risk band filter
-    eligible = _filter_by_risk_band(tickers, risk_scores, user_risk)
-    if not eligible:
-        logger.warning("No tickers in risk band for user_risk=%d; widening ±1.", user_risk)
-        eligible = _filter_by_risk_band(tickers, risk_scores, user_risk, widen=1)
-    if not eligible:
-        logger.warning("Still no eligible tickers after widening — returning empty picks.")
-        return _empty_output(macro_context)
+    # §13.1 — Risk band filter (relaxed to full range in custom mode)
+    if custom_mode:
+        eligible = [t for t in tickers if risk_scores.get(t, {}).get("risk_score") is not None]
+        if not eligible:
+            logger.warning("No tickers could be scored — returning empty picks.")
+            return _empty_output(macro_context)
+    else:
+        eligible = _filter_by_risk_band(tickers, risk_scores, user_risk)
+        if not eligible:
+            logger.warning("No tickers in risk band for user_risk=%d; widening ±1.", user_risk)
+            eligible = _filter_by_risk_band(tickers, risk_scores, user_risk, widen=1)
+        if not eligible:
+            logger.warning("Still no eligible tickers after widening — returning empty picks.")
+            return _empty_output(macro_context)
 
     # §13.2 — Quality scores
     scores = _compute_quality_scores(
@@ -98,14 +109,18 @@ def recommend(
     # Rank by macro-adjusted quality descending
     ranked = sorted(eligible, key=lambda s: scores[s]["macro_adjusted_quality"], reverse=True)
 
-    # §13.3-A — Sector caps (greedy)
-    selected = _apply_sector_caps(ranked)
+    if custom_mode:
+        # In custom mode keep every scored ticker — user chose these explicitly
+        selected = ranked
+    else:
+        # §13.3-A — Sector caps (greedy)
+        selected = _apply_sector_caps(ranked)
 
-    # §13.3-B — Correlation filter
-    selected = _apply_correlation_filter(selected, ranked, ticker_data, scores)
+        # §13.3-B — Correlation filter
+        selected = _apply_correlation_filter(selected, ranked, ticker_data, scores)
 
-    # §13.3-C — Currency balance
-    selected = _apply_currency_balance(selected, ranked, user_risk, scores)
+        # §13.3-C — Currency balance
+        selected = _apply_currency_balance(selected, ranked, user_risk, scores)
 
     # §13.4 — Portfolio weights
     weights = _compute_weights(selected, scores)

@@ -12,6 +12,8 @@ Start:
     uvicorn api:app --reload --port 8000
 """
 
+import asyncio
+import os
 import queue
 import sys
 import threading
@@ -37,8 +39,8 @@ _HERE = Path(__file__).parent.resolve()
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-REPORTS_DIR = (_HERE / "reports").resolve()
-REPORTS_DIR.mkdir(exist_ok=True)
+REPORTS_DIR = Path(os.environ.get("REPORTS_DIR", str(_HERE / "reports"))).resolve()
+REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="Stock Research API", version="1.0.0")
 
@@ -307,12 +309,12 @@ def get_job(job_id: str):
 
 
 @app.get("/api/jobs/{job_id}/stream")
-def stream_job(job_id: str):
+async def stream_job(job_id: str):
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(404, detail="Job not found")
 
-    def event_gen():
+    async def event_gen():
         # Replay all accumulated lines first (reconnect-safe)
         with job._lock:
             replay = list(job.log_lines)
@@ -325,12 +327,13 @@ def stream_job(job_id: str):
             yield f"data: {sentinel}\n\n"
             return
 
-        # Live tail
+        # Live tail — non-blocking so the event loop stays free
         while True:
             try:
-                msg = job.q.get(timeout=1.0)
+                msg = job.q.get_nowait()
             except queue.Empty:
                 yield ": keepalive\n\n"
+                await asyncio.sleep(1.0)
                 continue
             if msg is None:
                 sentinel = "[DONE]" if job.status == "done" else f"[ERROR] {job.error or ''}"
