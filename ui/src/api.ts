@@ -1,4 +1,4 @@
-import type { JobParams, CustomJobParams } from './types'
+import type { JobParams, CustomJobParams, PerformanceResponse } from './types'
 
 const BASE = '/api'
 
@@ -44,4 +44,20 @@ export async function createCustomJob(params: CustomJobParams): Promise<string> 
 
 export function getReportUrl(jobId: string): string {
   return `${BASE}/jobs/${jobId}/report`
+}
+
+export async function getPerformanceMetrics(symbols: string[]): Promise<PerformanceResponse> {
+  const r = await fetch(`${BASE}/performance`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ symbols }),
+  })
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({ detail: 'Unknown error' }))
+    const detail = Array.isArray(err.detail)
+      ? err.detail.map((e: { msg: string }) => e.msg).join('; ')
+      : String(err.detail ?? 'Unknown error')
+    throw new Error(detail)
+  }
+  return r.json()
 }

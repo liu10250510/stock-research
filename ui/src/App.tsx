@@ -1,11 +1,12 @@
 import { useState } from 'react'
 import ConfigForm from './components/ConfigForm'
 import CustomSymbolsForm from './components/CustomSymbolsForm'
+import PerformanceAnalysisForm from './components/PerformanceAnalysisForm'
 import ProgressPanel from './components/ProgressPanel'
 import DownloadButton from './components/DownloadButton'
 import { useJobStream } from './hooks/useJobStream'
 
-type Tab = 'portfolio' | 'custom'
+type Tab = 'portfolio' | 'custom' | 'performance'
 
 function TabButton({
   active, onClick, children,
@@ -84,6 +85,9 @@ export default function App() {
           <TabButton active={activeTab === 'custom'} onClick={() => switchTab('custom')}>
             Custom Analysis
           </TabButton>
+          <TabButton active={activeTab === 'performance'} onClick={() => switchTab('performance')}>
+            Performance Analysis
+          </TabButton>
         </div>
 
         {/* Card */}
@@ -91,16 +95,15 @@ export default function App() {
           className="bg-white rounded-2xl border border-slate-200 p-10"
           style={{ boxShadow: '0 2px 16px rgba(15,28,46,0.06)' }}
         >
-          {activeTab === 'portfolio'
-            ? <ConfigForm onJobStarted={handleJobStarted} disabled={isRunning} />
-            : <CustomSymbolsForm onJobStarted={handleJobStarted} disabled={isRunning} />
-          }
+          {activeTab === 'portfolio' && <ConfigForm onJobStarted={handleJobStarted} disabled={isRunning} />}
+          {activeTab === 'custom' && <CustomSymbolsForm onJobStarted={handleJobStarted} disabled={isRunning} />}
+          {activeTab === 'performance' && <PerformanceAnalysisForm />}
 
-          {jobId && (
+          {activeTab !== 'performance' && jobId && (
             <ProgressPanel lines={lines} status={status} error={error} />
           )}
 
-          {status === 'done' && jobId && (
+          {activeTab !== 'performance' && status === 'done' && jobId && (
             <DownloadButton jobId={jobId} filename={filename} />
           )}
         </div>

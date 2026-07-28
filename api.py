@@ -7,6 +7,7 @@ Endpoints:
     GET  /api/jobs/{id}            — poll job status + log
     GET  /api/jobs/{id}/stream     — SSE live log stream
     GET  /api/jobs/{id}/report     — download generated PDF
+    POST /api/performance          — instant ratio comparison (no job, no PDF)
 
 Start:
     uvicorn api:app --reload --port 8000
@@ -121,6 +122,19 @@ class JobRequest(BaseModel):
         return v
 
 # ---------------------------------------------------------------------------
+# Shared validation
+# ---------------------------------------------------------------------------
+
+def _clean_symbols(v: list[str]) -> list[str]:
+    cleaned = list(dict.fromkeys(s.strip().upper() for s in v if s.strip()))
+    if not cleaned:
+        raise ValueError("At least one symbol is required")
+    if len(cleaned) > 50:
+        raise ValueError("Maximum 50 symbols per request")
+    return cleaned
+
+
+# ---------------------------------------------------------------------------
 # Request schema — Custom Analysis
 # ---------------------------------------------------------------------------
 
@@ -134,12 +148,7 @@ class CustomJobRequest(BaseModel):
     @field_validator("symbols")
     @classmethod
     def check_symbols(cls, v):
-        cleaned = [s.strip().upper() for s in v if s.strip()]
-        if not cleaned:
-            raise ValueError("At least one symbol is required")
-        if len(cleaned) > 50:
-            raise ValueError("Maximum 50 symbols per request")
-        return cleaned
+        return _clean_symbols(v)
 
     @field_validator("risk")
     @classmethod
@@ -168,6 +177,19 @@ class CustomJobRequest(BaseModel):
         if not v.endswith(".pdf"):
             raise ValueError("output must end in .pdf")
         return v
+
+
+# ---------------------------------------------------------------------------
+# Request schema — Performance Analysis
+# ---------------------------------------------------------------------------
+
+class PerformanceRequest(BaseModel):
+    symbols: list[str]
+
+    @field_validator("symbols")
+    @classmethod
+    def check_symbols(cls, v):
+        return _clean_symbols(v)
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +310,18 @@ def create_custom_job(req: CustomJobRequest):
     JOBS[job_id] = job
     threading.Thread(target=_run_custom_job, args=(job,), daemon=True).start()
     return {"job_id": job_id}
+
+
+@app.post("/api/performance")
+def compute_performance(req: PerformanceRequest):
+    from data.fetcher import DataFetcher
+    from analysis.performance_metrics import compute_performance_metrics
+
+    fetcher = DataFetcher()
+    raw = fetcher.fetch_all(req.symbols)
+    results = [compute_performance_metrics(d) for d in raw.values()]
+    skipped = [s for s in req.symbols if s not in raw]
+    return {"results": results, "skipped": skipped}
 
 
 @app.get("/api/jobs/{job_id}")

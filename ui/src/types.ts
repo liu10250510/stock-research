@@ -29,3 +29,26 @@ export interface Job {
   error: string | null
   output_path: string | null
 }
+
+export interface PerformanceMetrics {
+  symbol: string
+  name: string | null
+  sector: string | null
+  is_etf: boolean
+  pe: number | null
+  forward_pe: number | null
+  peg_ratio: number | null
+  debt_equity: number | null
+  quick_ratio: number | null
+  current_ratio: number | null
+  roe: number | null
+  roa: number | null
+  interest_coverage: number | null
+  revenue_cagr_3y: number | null
+  eps_cagr_3y: number | null
+}
+
+export interface PerformanceResponse {
+  results: PerformanceMetrics[]
+  skipped: string[]
+}
