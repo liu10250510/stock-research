@@ -11,11 +11,7 @@ Public API:
 
 import io
 import logging
-import textwrap
 from datetime import date
-
-from PIL import Image as _PIL_Image
-_PIL_Image.MAX_IMAGE_PIXELS = None  # charts are generated internally — not user uploads
 
 from reportlab.lib.colors import HexColor, white, black
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
@@ -29,10 +25,12 @@ from reportlab.platypus import (
 
 from report.charts import (
     correlation_heatmap, dividend_history_chart, forecast_chart,
-    portfolio_allocation_pie, price_chart, returns_bar_chart, risk_score_breakdown,
+    portfolio_allocation_pie, price_chart, risk_score_breakdown,
     rsi_chart, scenario_bar_chart, sector_pie_chart, sentiment_gauge,
     universe_risk_bar,
 )
+from data.ticker_selector import EXCHANGE_MAP
+from analysis.risk_metrics import RISK_FREE_RATE
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +153,50 @@ def _img(buf: io.BytesIO, width: float, height: float) -> Image:
     buf.seek(0)
     return Image(buf, width=width, height=height)
 
+# Tallest image we can place and still leave room for a heading on the page.
+_MAX_IMG_H = PAGE_H - 2 * MARGIN - 60
+
+# Table styles are immutable and Table.setStyle only reads from them, so one
+# instance each is shared across the ~60 tables in a report rather than rebuilt.
+_KV_STYLE = TableStyle([
+    ("BACKGROUND",    (0, 0), (0, -1), LGRAY),
+    ("ROWBACKGROUNDS",(0, 0), (-1, -1), [white, LGRAY]),
+    ("GRID",          (0, 0), (-1, -1), 0.3, HexColor("#DDDDDD")),
+    ("TOPPADDING",    (0, 0), (-1, -1), 4),
+    ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ("LEFTPADDING",   (0, 0), (-1, -1), 6),
+    ("RIGHTPADDING",  (0, 0), (-1, -1), 6),
+])
+
+_DATA_STYLE = TableStyle([
+    ("BACKGROUND",    (0, 0), (-1, 0), NAVY),
+    ("ROWBACKGROUNDS",(0, 1), (-1, -1), [white, LGRAY]),
+    ("GRID",          (0, 0), (-1, -1), 0.3, HexColor("#DDDDDD")),
+    ("TOPPADDING",    (0, 0), (-1, -1), 4),
+    ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ("LEFTPADDING",   (0, 0), (-1, -1), 5),
+    ("RIGHTPADDING",  (0, 0), (-1, -1), 5),
+    ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+])
+
+# Two of these are built per ticker page.
+_MINI_STYLE = TableStyle([
+    ("BACKGROUND",    (0, 0), (-1, 0),   BLUE),
+    ("TEXTCOLOR",     (0, 0), (-1, 0),   white),
+    ("FONTNAME",      (0, 0), (-1, 0),   "Helvetica-Bold"),
+    ("FONTSIZE",      (0, 0), (-1, -1),  8),
+    ("ROWBACKGROUNDS",(0, 1), (-1, -1),  [white, LGRAY]),
+    ("GRID",          (0, 0), (-1, -1),  0.3, HexColor("#DDDDDD")),
+    ("TOPPADDING",    (0, 0), (-1, -1),  4),
+    ("BOTTOMPADDING", (0, 0), (-1, -1),  4),
+    ("LEFTPADDING",   (0, 0), (-1, -1),  6),
+])
+
+_SIDE_BY_SIDE_STYLE = TableStyle([
+    ("LEFTPADDING",  (0, 0), (-1, -1), 0),
+    ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+])
+
 def _pct(v, decimals=1):
     if v is None:
         return "—"
@@ -192,15 +234,7 @@ def _kv_table(pairs: list, col_widths=None) -> Table:
              Paragraph(str(v) if v is not None else "—", ST["td"])]
             for k, v in pairs]
     t = Table(data, colWidths=col_widths, hAlign="LEFT")
-    t.setStyle(TableStyle([
-        ("BACKGROUND",   (0, 0), (0, -1), LGRAY),
-        ("ROWBACKGROUNDS",(0, 0), (-1, -1), [white, LGRAY]),
-        ("GRID",         (0, 0), (-1, -1), 0.3, HexColor("#DDDDDD")),
-        ("TOPPADDING",   (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING",(0, 0), (-1, -1), 4),
-        ("LEFTPADDING",  (0, 0), (-1, -1), 6),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-    ]))
+    t.setStyle(_KV_STYLE)
     return t
 
 def _data_table(headers: list, rows: list, col_widths=None) -> Table:
@@ -214,17 +248,7 @@ def _data_table(headers: list, rows: list, col_widths=None) -> Table:
     n_cols = len(headers)
     col_widths = col_widths or [CONTENT_W / n_cols] * n_cols
     t = Table(data, colWidths=col_widths, hAlign="LEFT", repeatRows=1)
-    row_bgs = [LGRAY if i % 2 == 0 else white for i in range(len(body_rows))]
-    t.setStyle(TableStyle([
-        ("BACKGROUND",    (0, 0), (-1, 0), NAVY),
-        ("ROWBACKGROUNDS",(0, 1), (-1, -1), [white, LGRAY]),
-        ("GRID",          (0, 0), (-1, -1), 0.3, HexColor("#DDDDDD")),
-        ("TOPPADDING",    (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-        ("LEFTPADDING",   (0, 0), (-1, -1), 5),
-        ("RIGHTPADDING",  (0, 0), (-1, -1), 5),
-        ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
-    ]))
+    t.setStyle(_DATA_STYLE)
     return t
 
 # ---------------------------------------------------------------------------
@@ -296,7 +320,16 @@ def _page_cover(story: list, user_risk: int):
         "Data source: Yahoo Finance (prices delayed ~15 min) · Web research: DuckDuckGo",
         ST["cover_sub"],
     ))
-    story.append(_sp(80))
+    story.append(_sp(14))
+    story.append(Paragraph(
+        f"Key assumptions: risk-free rate {RISK_FREE_RATE:.2%} (applied to both CAD and "
+        "USD assets); Sharpe and Sortino use trailing 1-year returns and volatility. "
+        "Figures for each security are stated in its own listing currency — CAD for "
+        "TSX-listed, USD for US-listed — and are not converted. A Canadian holder's "
+        "realized return on USD positions will differ by the CAD/USD move over the period.",
+        ST["small"],
+    ))
+    story.append(_sp(60))
     story.append(Paragraph(
         "⚠ Not financial advice. For educational purposes only. "
         "Past performance does not guarantee future results. "
@@ -354,7 +387,8 @@ def _page_macro(story: list, macro_context: dict, user_risk: int):
 # Page 3 — Risk Profile Summary
 # ---------------------------------------------------------------------------
 
-def _page_risk_profile(story: list, user_risk: int, all_scores: dict):
+def _page_risk_profile(story: list, user_risk: int, all_scores: dict,
+                       risk_bar_png: bytes | None = None):
     story.append(_section("Risk Profile Summary"))
     story.append(_sp(6))
 
@@ -394,14 +428,10 @@ def _page_risk_profile(story: list, user_risk: int, all_scores: dict):
     ))
     story.append(_sp(10))
 
-    # Universe risk bar (if scores provided)
-    if all_scores:
+    # Universe risk bar — rendered once in generate_pdf, shared with page 12
+    if risk_bar_png:
         story.append(_subsection("Universe Risk Score Distribution"))
-        try:
-            buf = universe_risk_bar(all_scores, user_risk)
-            story.append(_img(buf, CONTENT_W, _WIDE_H))
-        except Exception as exc:
-            logger.warning("universe_risk_bar failed: %s", exc)
+        story.append(_img(io.BytesIO(risk_bar_png), CONTENT_W, _WIDE_H))
     story.append(PageBreak())
 
 # ---------------------------------------------------------------------------
@@ -418,7 +448,7 @@ def _page_recommendations(story: list, picks: list):
     headers = [
         "Symbol", "Name", "Type", "Sector",
         "Risk", "Sharpe", "1y Ret", "Consensus",
-        "Sentiment", "3m↑", "Wt%",
+        "Sentiment", "3m proj.", "Wt%",
     ]
     rows = []
     for p in picks:
@@ -446,7 +476,10 @@ def _page_recommendations(story: list, picks: list):
     story.append(_sp(8))
     story.append(_small(
         "Risk: 1–10 (lower = more conservative). Sharpe: return per unit of risk (higher = better). "
-        "3m↑: 12-month analyst target extrapolated to 3 months. Wt%: recommended portfolio weight."
+        "1y Ret: total return in the security's own listing currency. "
+        "3m proj.: model estimate blending analyst targets with 3-month price momentum — "
+        "not an analyst target. For ETFs, which have no analyst coverage, it is momentum only. "
+        "Wt%: recommended portfolio weight."
     ))
     story.append(PageBreak())
 
@@ -472,8 +505,9 @@ def _page_allocation(story: list, picks: list, rec_result: dict, ticker_data: di
     rows = []
     for p in picks:
         f = p.get("fundamentals", {}) or {}
-        from data.ticker_selector import EXCHANGE_MAP
-        currency = "CAD" if EXCHANGE_MAP.get(p["symbol"], "NYSE") == "TSX" else "USD"
+        # Resolved from the fetched listing data; falls back to the static map.
+        currency = p.get("currency") or (
+            "CAD" if EXCHANGE_MAP.get(p["symbol"], "NYSE") == "TSX" else "USD")
         rows.append([
             p["symbol"],
             (f.get("name") or p["symbol"])[:20],
@@ -499,21 +533,14 @@ def _page_allocation(story: list, picks: list, rec_result: dict, ticker_data: di
     story.append(_kv_table(pairs))
     story.append(_sp(10))
 
-    # Correlation heatmap
-    import pandas as pd
+    # Correlation heatmap — matrix comes from recommend(); no recompute here.
     try:
-        syms = [p["symbol"] for p in picks]
-        returns_map = {}
-        for sym in syms:
-            td = ticker_data.get(sym, {})
-            hist = td.get("history") if td else None
-            if hist is not None and not hist.empty:
-                returns_map[sym] = hist["Close"].pct_change().tail(252)
-        if len(returns_map) >= 2:
-            corr = pd.DataFrame(returns_map).corr()
+        corr = rec_result.get("correlation_matrix")
+        if corr is not None and not corr.empty:
+            syms = list(corr.columns)
             story.append(_subsection("Pick Correlation Heatmap"))
-            buf = correlation_heatmap(corr, list(returns_map.keys()))
-            sz  = min(CONTENT_W, len(returns_map) * 52)
+            buf = correlation_heatmap(corr, syms)
+            sz  = min(CONTENT_W, len(syms) * 52)
             story.append(_img(buf, sz, sz * 0.85))
             story.append(_sp(8))
     except Exception as exc:
@@ -523,13 +550,31 @@ def _page_allocation(story: list, picks: list, rec_result: dict, ticker_data: di
     pc = rec_result.get("portfolio_cost", {})
     if pc:
         story.append(_subsection("Portfolio Cost Summary"))
+
+        t_cad = pc.get("trading_cost_cad", 0) or 0
+        t_usd = pc.get("trading_cost_usd", 0) or 0
+        commissions = f"${t_cad:.2f} CAD"
+        if t_usd:
+            # Kept separate — these are quoted in the listing currency and were
+            # previously summed into a single "CAD" figure.
+            commissions += f"  +  ${t_usd:.2f} USD"
+
+        drag_cad = pc.get("annual_etf_drag_cad")
+        drag_pct = pc.get("annual_etf_drag_pct")
+        drag_txt = (f"${drag_cad:.2f}  ({drag_pct:.3f}%)"
+                    if drag_cad is not None and drag_pct is not None
+                    else "Not available")
+
         cost_pairs = [
             ("Assumed portfolio size",   f"${pc.get('assumed_portfolio_cad',0):,} CAD"),
-            ("One-time trading + FX",    f"${pc.get('total_upfront_cost',0):.2f}"),
-            ("Annual ETF drag",          f"${pc.get('annual_etf_drag_cad',0):.2f}  ({pc.get('annual_etf_drag_pct',0):.3f}%)"),
-            ("ETF cost efficiency",      pc.get('etf_cost_efficiency', '—')),
-            ("Platform",                 pc.get('platform', '—').replace('_', ' ').title()),
+            ("One-time commissions",     commissions),
+            ("FX conversion (USD buys)", f"${pc.get('total_fx_conversion_cost',0):.2f} CAD"),
+            ("Annual ETF drag",          drag_txt),
         ]
+        if pc.get("etf_cost_efficiency"):
+            cost_pairs.append(("ETF cost efficiency", pc["etf_cost_efficiency"]))
+        cost_pairs.append(("Platform", pc.get('platform', '—').replace('_', ' ').title()))
+
         story.append(_kv_table(cost_pairs))
         breakdown = pc.get("cost_efficiency_breakdown", [])
         if breakdown:
@@ -540,6 +585,11 @@ def _page_allocation(story: list, picks: list, rec_result: dict, ticker_data: di
                  for b in breakdown],
                 col_widths=[80, 80, CONTENT_W - 160],
             ))
+        missing = pc.get("etfs_missing_mer") or []
+        if missing:
+            story.append(_small(
+                "MER unavailable from the data source for: " + ", ".join(missing) +
+                ". Annual drag above excludes them and is therefore understated."))
         story.append(_small(pc.get("note", "")))
     story.append(PageBreak())
 
@@ -588,9 +638,15 @@ def _page_scenarios(story: list, scenario_result: dict):
     story.append(_subsection("Portfolio Statistics"))
     story.append(_kv_table([
         ("Portfolio beta",       _num(scenario_result.get("portfolio_beta"), ".2f")),
-        ("Weighted Sharpe ratio",_num(scenario_result.get("portfolio_sharpe"), ".2f")),
-        ("Weighted max drawdown",_pct(scenario_result.get("portfolio_max_dd"))),
+        ("Weighted avg Sharpe",  _num(scenario_result.get("portfolio_sharpe"), ".2f")),
+        ("Weighted avg max drawdown", _pct(scenario_result.get("portfolio_max_dd"))),
     ]))
+    story.append(_small(
+        "Sharpe and max drawdown are weight-averaged across holdings, not computed on the "
+        "combined portfolio. Neither is linear in weights: the averaged Sharpe ignores the "
+        "diversification benefit shown by the correlation figures, and the averaged drawdown "
+        "assumes every holding bottoms on the same day, so it is a pessimistic bound."
+    ))
     story.append(_sp(8))
 
     # Plain-English interpretations
@@ -685,6 +741,20 @@ def _page_ticker(story: list, pick: dict, ticker_data: dict):
             story.append(_img(f_buf, CONTENT_W, _WIDE_H))
         except Exception as exc:
             logger.warning("forecast_chart(%s): %s", sym, exc)
+        # State what the projection is actually built from — it is not an
+        # analyst target, and for ETFs it contains no analyst input at all.
+        _basis_note = {
+            "blend":    "3-month projection blends analyst price targets with price momentum.",
+            "analyst":  "3-month projection derived from analyst price targets.",
+            "momentum": "3-month projection derived from price momentum only — "
+                        "this security has no analyst price target.",
+        }.get(fc.get("forecast_basis"))
+        if _basis_note:
+            au = fc.get("analyst_upside_pct")
+            if au is not None:
+                _basis_note += (f" Analyst mean target separately implies "
+                                f"{au:+.1f}% over 12 months.")
+            story.append(_small(_basis_note))
         story.append(_sp(8))
 
     # ── Returns + risk metrics ───────────────────────────────────────────────
@@ -701,33 +771,19 @@ def _page_ticker(story: list, pick: dict, ticker_data: dict):
 
     def _mini_table(data):
         t_obj = Table(data, colWidths=[_HALF_W*0.5, _HALF_W*0.5])
-        t_obj.setStyle(TableStyle([
-            ("BACKGROUND",    (0, 0), (-1, 0),   BLUE),
-            ("TEXTCOLOR",     (0, 0), (-1, 0),   white),
-            ("FONTNAME",      (0, 0), (-1, 0),   "Helvetica-Bold"),
-            ("FONTSIZE",      (0, 0), (-1, -1),  8),
-            ("ROWBACKGROUNDS",(0, 1), (-1, -1),  [white, LGRAY]),
-            ("GRID",          (0, 0), (-1, -1),  0.3, HexColor("#DDDDDD")),
-            ("TOPPADDING",    (0, 0), (-1, -1),  4),
-            ("BOTTOMPADDING", (0, 0), (-1, -1),  4),
-            ("LEFTPADDING",   (0, 0), (-1, -1),  6),
-        ]))
+        t_obj.setStyle(_MINI_STYLE)
         return t_obj
 
     side_by_side = Table(
         [[_mini_table(ret_rows), _mini_table(met_rows)]],
         colWidths=[_HALF_W, _HALF_W], hAlign="LEFT",
     )
-    side_by_side.setStyle(TableStyle([("LEFTPADDING", (0,0),(-1,-1), 0),
-                                       ("RIGHTPADDING",(0,0),(-1,-1), 6)]))
+    side_by_side.setStyle(_SIDE_BY_SIDE_STYLE)
     story.append(side_by_side)
     story.append(_sp(8))
 
     # ── Risk score breakdown chart ───────────────────────────────────────────
     components = pick.get("risk_score_components") or {}
-    if not components:
-        # Try extracting from raw risk_scores if attached
-        pass
     if components:
         try:
             rb_buf = risk_score_breakdown(components, sym)
@@ -745,9 +801,9 @@ def _page_ticker(story: list, pick: dict, ticker_data: dict):
     story.append(_sp(8))
 
     if is_etf:
-        _etf_section(story, pick, f, history)
+        _etf_section(story, pick, f)
     else:
-        _stock_section(story, pick, f, history)
+        _stock_section(story, pick, f)
 
     # ── Analyst consensus ────────────────────────────────────────────────────
     story.append(_subsection("Analyst Consensus"))
@@ -803,18 +859,21 @@ def _page_ticker(story: list, pick: dict, ticker_data: dict):
     story.append(PageBreak())
 
 
-def _stock_section(story, pick, f, history):
+def _stock_section(story, pick, f):
+    ccy = pick.get("currency") or "—"
     """Stock-specific content: fundamentals, dividends, cost."""
     story.append(_subsection("Fundamentals"))
+    # Absolute-dollar figures are reported in the security's own listing currency,
+    # which is not necessarily the CAD the portfolio is sized in.
     story.append(_kv_table([
         ("P/E (trailing)",    _num(f.get("pe"), ".1f")),
         ("Forward P/E",       _num(f.get("forward_pe"), ".1f")),
-        ("EPS",               _num(f.get("eps"), ".2f")),
-        ("Revenue",           f"${f.get('revenue') or 0:,.0f}" if f.get("revenue") else "—"),
+        ("EPS",               f"{f['eps']:.2f} {ccy}" if f.get("eps") is not None else "—"),
+        ("Revenue",           f"${f['revenue']:,.0f} {ccy}" if f.get("revenue") else "—"),
         ("Revenue growth",    _pct(f.get("revenue_growth"))),
-        ("Net income",        f"${f.get('net_income') or 0:,.0f}" if f.get("net_income") else "—"),
+        ("Net income",        f"${f['net_income']:,.0f} {ccy}" if f.get("net_income") else "—"),
         ("Net margin",        _pct(f.get("net_margin"))),
-        ("Total assets",      f"${f.get('total_assets') or 0:,.0f}" if f.get("total_assets") else "—"),
+        ("Total assets",      f"${f['total_assets']:,.0f} {ccy}" if f.get("total_assets") else "—"),
         ("Debt / Equity",     _num(f.get("debt_equity"), ".2f")),
         ("Current ratio",     _num(f.get("current_ratio"), ".2f")),
     ]))
@@ -823,8 +882,9 @@ def _stock_section(story, pick, f, history):
     story.append(_subsection("Dividends"))
     div_hist = f.get("dividend_history", {}) or {}
     story.append(_kv_table([
-        ("Dividend yield",       _pct(f.get("dividend_yield"))),
-        ("Annual div / share",   f"${f.get('annual_div_per_share') or 0:.2f}" if f.get("annual_div_per_share") else "—"),
+        ("Dividend yield (trailing)", _pct(f.get("dividend_yield"))),
+        ("Annual div / share (forward run-rate)",
+         f"${f['annual_div_per_share']:.2f} {ccy}" if f.get("annual_div_per_share") else "—"),
         ("Ex-dividend date",     f.get("ex_dividend_date") or "—"),
     ]))
     if div_hist:
@@ -839,13 +899,15 @@ def _stock_section(story, pick, f, history):
     _cost_box(story, pick, f)
 
 
-def _etf_section(story, pick, f, history):
+def _etf_section(story, pick, f):
+    ccy = pick.get("currency") or "—"
     """ETF-specific content: details, holdings, sector pie, cost."""
     story.append(_subsection("ETF Details"))
     aum = f.get("aum")
     story.append(_kv_table([
-        ("Expense ratio (MER)", f"{(f.get('expense_ratio_raw') or 0)*100:.2f}%" if f.get("expense_ratio_raw") else "—"),
-        ("AUM",                 f"${aum/1e9:.1f}B" if aum and aum >= 1e9 else (f"${aum/1e6:.0f}M" if aum else "—")),
+        ("Expense ratio (MER)", f"{f['expense_ratio_raw']*100:.2f}%"
+                                if f.get("expense_ratio_raw") else "Not available"),
+        ("AUM",                 (f"${aum/1e9:.1f}B {ccy}" if aum >= 1e9 else f"${aum/1e6:.0f}M {ccy}") if aum else "—"),
         ("Distribution yield",  _pct(f.get("distribution_yield"))),
         ("Beta",                _num(f.get("beta"), ".2f")),
     ]))
@@ -890,36 +952,56 @@ def _cost_box(story, pick, f):
     """Render cost box for stock or ETF."""
     cost = f.get("cost", {}) or {}
     story.append(_subsection("Cost"))
-    pairs = [
-        ("Expense ratio",       f"{(cost.get('expense_ratio',0) or 0)*100:.2f}%"),
-        ("Annual drag / $10k",  f"${cost.get('annual_drag_per_10k',0):.2f}"),
-        ("Cost efficiency",     cost.get("cost_efficiency","—")),
-        ("One-time trading",    f"${cost.get('trading_cost_cad',0):.2f} (approx.)"),
-        ("FX conversion",       "~1.50% on purchase" if cost.get("fx_conversion_applicable") else "Not applicable (CAD)"),
-    ]
+
+    mer  = cost.get("expense_ratio")
+    drag = cost.get("annual_drag_per_10k")
+    eff  = cost.get("cost_efficiency")
+    ccy  = cost.get("trading_cost_currency") or "CAD"
+    trade = cost.get("trading_cost")
+
+    pairs = []
+    # MER rows are omitted entirely for stocks (no such thing) and shown as
+    # unavailable — never 0.00% — for ETFs Yahoo has no expense ratio for.
+    if pick.get("is_etf"):
+        pairs.append(("Expense ratio (MER)",
+                      cost.get("expense_ratio_pct") or "Not available"))
+        pairs.append(("Annual drag / $10k",
+                      f"${drag:.2f}" if drag is not None else "Not available"))
+        if eff:
+            pairs.append(("Cost efficiency", eff))
+    pairs.append(("One-time trading",
+                  f"${trade:.2f} {ccy} (approx.)" if trade is not None else "—"))
+    pairs.append(("FX conversion",
+                  "~1.50% on purchase (USD)" if cost.get("fx_conversion_applicable")
+                  else "Not applicable (CAD-listed)"))
+
     story.append(_kv_table(pairs))
+    if pick.get("is_etf") and mer is None:
+        story.append(_small("MER unavailable from the data source for this fund — "
+                            "check the provider's fund page before assuming cost."))
     story.append(_sp(8))
 
 # ---------------------------------------------------------------------------
 # Page 12 — Universe Overview
 # ---------------------------------------------------------------------------
 
-def _page_universe(story: list, all_scores: dict, risk_metrics: dict, user_risk: int):
+def _page_universe(story: list, all_scores: dict, risk_metrics: dict, user_risk: int,
+                   risk_bar_png: bytes | None = None):
     story.append(_section("Universe Overview"))
     story.append(_sp(6))
 
-    try:
-        buf = universe_risk_bar(all_scores, user_risk)
-        story.append(_img(buf, CONTENT_W, max(_WIDE_H, len(all_scores) * 14)))
-    except Exception as exc:
-        logger.warning("universe_risk_bar failed: %s", exc)
+    if risk_bar_png:
+        # Clamp to the frame — len(all_scores) * 14 overflows the page past ~49 tickers.
+        img_h = min(_MAX_IMG_H, max(_WIDE_H, len(all_scores) * 14))
+        story.append(_img(io.BytesIO(risk_bar_png), CONTENT_W, img_h))
     story.append(_sp(10))
 
     story.append(_subsection("All Tickers — Ranked by Risk Score"))
-    scores = {}
-    for sym, v in all_scores.items():
-        scores[sym] = v["risk_score"] if isinstance(v, dict) else float(v or 0)
-    sorted_tickers = sorted(scores.items(), key=lambda x: x[1])
+    # all_scores is already normalised to {"risk_score": float} by generate_pdf
+    sorted_tickers = sorted(
+        ((sym, v["risk_score"]) for sym, v in all_scores.items()),
+        key=lambda x: x[1],
+    )
 
     rows = []
     for sym, rs in sorted_tickers:
@@ -977,9 +1059,17 @@ def generate_pdf(
     all_scores = {sym: (v if isinstance(v, dict) else {"risk_score": float(v or 0)})
                   for sym, v in risk_scores.items()}
 
+    # Rendered once — pages 3 and 12 embed the same chart.
+    risk_bar_png = None
+    if all_scores:
+        try:
+            risk_bar_png = universe_risk_bar(all_scores, user_risk).getvalue()
+        except Exception as exc:
+            logger.warning("universe_risk_bar failed: %s", exc)
+
     _page_cover(story, user_risk)
     _page_macro(story, macro_context, user_risk)
-    _page_risk_profile(story, user_risk, all_scores)
+    _page_risk_profile(story, user_risk, all_scores, risk_bar_png)
     _page_recommendations(story, picks)
     _page_allocation(story, picks, rec_result, ticker_data)
     _page_scenarios(story, scenario_result)
@@ -987,7 +1077,7 @@ def generate_pdf(
     for pick in picks:
         _page_ticker(story, pick, ticker_data)
 
-    _page_universe(story, all_scores, risk_metrics, user_risk)
+    _page_universe(story, all_scores, risk_metrics, user_risk, risk_bar_png)
 
     doc.build(story)
     logger.info("PDF written to %s", output_path)

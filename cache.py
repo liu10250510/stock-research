@@ -7,6 +7,8 @@ Default TTL is 24 hours so repeated runs within a day produce stable output.
 import hashlib
 import json
 import logging
+import os
+import threading
 import time
 from pathlib import Path
 
@@ -14,6 +16,11 @@ logger = logging.getLogger(__name__)
 
 _CACHE_DIR = Path(__file__).parent / ".search_cache"
 TTL = 86_400  # seconds — override in tests or via monkey-patch
+
+# Empty results are cached so failing queries aren't retried on every run, but for
+# much less time: an empty list is often a transient throttle rather than a real
+# "nothing found", and we don't want to pin that for a full day.
+EMPTY_TTL = 1_800
 
 
 def _path(query: str) -> Path:
@@ -28,9 +35,12 @@ def get(query: str) -> list | None:
         if not p.exists():
             return None
         data = json.loads(p.read_text(encoding="utf-8"))
-        if time.time() - data["ts"] > TTL:
+        results = data["results"]
+        ttl = TTL if results else EMPTY_TTL
+        if time.time() - data["ts"] > ttl:
+            p.unlink(missing_ok=True)  # evict eagerly so the dir stays bounded
             return None
-        return data["results"]
+        return results
     except Exception as exc:
         logger.debug("Cache read failed for %r: %s", query[:60], exc)
         return None
@@ -40,10 +50,14 @@ def put(query: str, results: list) -> None:
     """Persist *results* for *query*."""
     try:
         _CACHE_DIR.mkdir(exist_ok=True)
-        _path(query).write_text(
+        p = _path(query)
+        tmp = p.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(
             json.dumps({"ts": time.time(), "results": results}, ensure_ascii=False),
             encoding="utf-8",
         )
+        # Atomic rename — concurrent research threads never see a partial file.
+        tmp.replace(p)
     except Exception as exc:
         logger.debug("Cache write failed for %r: %s", query[:60], exc)
 

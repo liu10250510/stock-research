@@ -23,6 +23,7 @@ Usage:
 import logging
 from collections import defaultdict
 
+import numpy as np
 import pandas as pd
 
 from data.ticker_selector import SECTOR_MAP, EXCHANGE_MAP, ETF_TICKERS
@@ -39,11 +40,25 @@ _RISK_BANDS: dict[tuple, tuple] = {
     (7, 10): (5.5, 10.0),
 }
 
-_TARGET_PICKS: dict[tuple, int] = {
-    (1, 3):  8,
-    (4, 6):  10,
-    (7, 10): 10,
-}
+def _is_etf(sym: str, ticker_data: dict | None) -> bool:
+    """ETF-ness from the fetched listing data, falling back to the static pool.
+
+    ETF_TICKERS only covers the 86-name pool, so custom symbols outside it (e.g.
+    VFV.TO) were previously analysed as individual stocks.
+    """
+    d = (ticker_data or {}).get(sym)
+    if d is not None and "is_etf" in d:
+        return bool(d["is_etf"])
+    return sym in ETF_TICKERS
+
+
+def _is_cad(sym: str, ticker_data: dict | None) -> bool:
+    """TSX-listed (CAD) from the fetched listing data, falling back to the map."""
+    d = (ticker_data or {}).get(sym)
+    if d is not None and d.get("exchange"):
+        return d["exchange"] == "TSX"
+    return EXCHANGE_MAP.get(sym, "NYSE") == "TSX"
+
 
 CONSENSUS_RATING: dict[str, int] = {
     "Strong Buy":        5,
@@ -101,9 +116,14 @@ def recommend(
             logger.warning("Still no eligible tickers after widening — returning empty picks.")
             return _empty_output(macro_context)
 
+    # Per-symbol daily returns are needed by the correlation filter and again for
+    # the final matrix. Memoised here so pct_change runs at most once per symbol.
+    _returns_memo: dict = {}
+
     # §13.2 — Quality scores
     scores = _compute_quality_scores(
-        eligible, risk_metrics, technicals, fundamentals, forecasts, macro_context
+        eligible, risk_metrics, technicals, fundamentals, forecasts, macro_context,
+        ticker_data,
     )
 
     # Rank by macro-adjusted quality descending
@@ -114,13 +134,14 @@ def recommend(
         selected = ranked
     else:
         # §13.3-A — Sector caps (greedy)
-        selected = _apply_sector_caps(ranked)
+        selected = _apply_sector_caps(ranked, ticker_data)
 
         # §13.3-B — Correlation filter
-        selected = _apply_correlation_filter(selected, ranked, ticker_data, scores)
+        selected = _apply_correlation_filter(selected, ranked, ticker_data, scores,
+                                             memo=_returns_memo)
 
         # §13.3-C — Currency balance
-        selected = _apply_currency_balance(selected, ranked, user_risk, scores)
+        selected = _apply_currency_balance(selected, ranked, user_risk, scores, ticker_data)
 
     # §13.4 — Portfolio weights
     weights = _compute_weights(selected, scores)
@@ -131,6 +152,8 @@ def recommend(
         pick = _assemble_pick(
             sym, weights[sym], scores[sym],
             risk_scores, risk_metrics, technicals, fundamentals, forecasts, sentiments,
+            is_etf=_is_etf(sym, ticker_data),
+            is_cad=_is_cad(sym, ticker_data),
         )
         pick["explanation"] = build_explanation(pick)
         picks.append(pick)
@@ -143,16 +166,21 @@ def recommend(
     currency_breakdown = {"CAD": 0, "USD": 0}
     for sym in selected:
         sector_breakdown[SECTOR_MAP.get(sym, "Unknown")] += 1
-        if EXCHANGE_MAP.get(sym, "NYSE") == "TSX":
+        if _is_cad(sym, ticker_data):
             currency_breakdown["CAD"] += 1
         else:
             currency_breakdown["USD"] += 1
+
+    # Built once for the final selection and published so the PDF's correlation
+    # heatmap and the average below both reuse it instead of recomputing.
+    corr_matrix = _corr_matrix(selected, ticker_data, _returns_memo)
 
     return {
         "picks":               picks,
         "sector_breakdown":    dict(sector_breakdown),
         "currency_breakdown":  currency_breakdown,
-        "avg_portfolio_corr":  _avg_portfolio_corr(selected, ticker_data),
+        "avg_portfolio_corr":  _avg_portfolio_corr(corr_matrix),
+        "correlation_matrix":  corr_matrix,
         "total_picks":         len(picks),
         "macro_context":       macro_context,
         "portfolio_cost":      portfolio_cost,
@@ -241,9 +269,19 @@ def build_explanation(merged_pick: dict) -> dict:
             f"{upgrades} analyst upgrade(s) in the last 30 days — recent positive re-rating."
         )
 
+    # upside_pct comes from a blended analyst+momentum model over 3 months, so it
+    # must not be attributed to analysts. When the ticker genuinely has analyst
+    # targets, quote the analyst implication separately and on its own horizon.
     if upside_pct is not None and upside_pct > 10:
+        basis = "analyst targets and price momentum" if fc.get("model_a") else "price momentum"
         bullets.append(
-            f"Analyst price target implies {upside_pct:.1f}% upside from current price over 12 months."
+            f"3-month projection implies {upside_pct:.1f}% upside, based on {basis}."
+        )
+
+    analyst_upside = fc.get("analyst_upside_pct")
+    if analyst_upside is not None and analyst_upside > 10:
+        bullets.append(
+            f"Analyst price target implies {analyst_upside:.1f}% upside over 12 months."
         )
 
     if rsi is not None and rsi < 45:
@@ -342,6 +380,13 @@ def _band_for_risk(user_risk: int) -> tuple:
 # §13.2 — Quality scores
 # ---------------------------------------------------------------------------
 
+def _norm(value: float, lo: float, hi: float) -> float:
+    """Clamp *value* into [lo, hi] and rescale to 0-1."""
+    if hi == lo:
+        return 0.0
+    return max(0.0, min(1.0, (float(value) - lo) / (hi - lo)))
+
+
 def _compute_quality_scores(
     eligible: list,
     risk_metrics: dict,
@@ -349,8 +394,16 @@ def _compute_quality_scores(
     fundamentals: dict,
     forecasts: dict,
     macro_context: dict,
+    ticker_data: dict | None = None,
 ) -> dict:
-    """Return {sym: {"quality_score": float, "macro_adjusted_quality": float}}."""
+    """Return {sym: {"quality_score": float, "macro_adjusted_quality": float}}.
+
+    Every input is normalised to 0–1 before weighting. Previously the terms were
+    on wildly different scales — analyst rating and low-debt on 1–5, Sharpe on
+    ~0–3.5, but momentum and margin as raw decimals (0.17, 0.25) — so the nominal
+    20% momentum weight contributed about 1% of the score and the 15% margin
+    weight about 4%. The stated weights now actually bind.
+    """
     sector_mods = macro_context.get("sector_modifiers", {})
     result: dict[str, dict] = {}
 
@@ -360,22 +413,31 @@ def _compute_quality_scores(
         f  = fundamentals.get(sym,   {}) or {}
         fc = forecasts.get(sym,      {}) or {}
 
-        sharpe      = rm.get("sharpe_ratio") or 0.0
-        analyst_r   = CONSENSUS_RATING.get(fc.get("consensus_label", ""), 3)
-        momentum_1m = t.get("return_1m") or 0.0
+        # Sharpe: -1..3 is the meaningful range for a 1-year window.
+        sharpe_n    = _norm(rm.get("sharpe_ratio") or 0.0, -1.0, 3.0)
+        # Consensus rating is 1..5.
+        analyst_n   = _norm(CONSENSUS_RATING.get(fc.get("consensus_label", ""), 3), 1.0, 5.0)
+        # A month of +/-15% covers all but extreme moves.
+        momentum_n  = _norm(t.get("return_1m") or 0.0, -0.15, 0.15)
 
-        if sym in ETF_TICKERS:
-            quality = sharpe * 0.35 + analyst_r * 0.30 + momentum_1m * 0.35
+        if _is_etf(sym, ticker_data):
+            quality = sharpe_n * 0.35 + analyst_n * 0.30 + momentum_n * 0.35
         else:
-            margin   = f.get("net_margin") or 0.0
-            low_debt = _debt_to_low_debt_score(f.get("debt_equity"))
-            quality  = (
-                sharpe      * 0.30
-                + analyst_r * 0.25
-                + momentum_1m * 0.20
-                + margin    * 0.15
-                + low_debt  * 0.10
+            # Net margin: 0-40% spans loss-making to highly profitable.
+            margin_n   = _norm(f.get("net_margin") or 0.0, 0.0, 0.40)
+            # _debt_to_low_debt_score returns 1..5.
+            low_debt_n = _norm(_debt_to_low_debt_score(f.get("debt_equity")), 1.0, 5.0)
+            quality = (
+                sharpe_n     * 0.30
+                + analyst_n  * 0.25
+                + momentum_n * 0.20
+                + margin_n   * 0.15
+                + low_debt_n * 0.10
             )
+
+        # Rescale the 0-1 composite onto the 0.5-5.0 band the macro modifier and
+        # downstream clamping already assume.
+        quality *= 5.0
 
         modifier = sector_mods.get(SECTOR_MAP.get(sym, ""), 0.0)
         macro_q  = max(0.5, min(5.0, quality + modifier))
@@ -407,14 +469,14 @@ def _debt_to_low_debt_score(de) -> float:
 # §13.3-A — Sector caps
 # ---------------------------------------------------------------------------
 
-def _apply_sector_caps(ranked: list) -> list:
+def _apply_sector_caps(ranked: list, ticker_data: dict | None = None) -> list:
     """Greedy selection respecting per-sector and ETF-total caps."""
     sector_counts: dict[str, int] = defaultdict(int)
     etf_count = 0
     selected: list[str] = []
 
     for sym in ranked:
-        if sym in ETF_TICKERS:
+        if _is_etf(sym, ticker_data):
             if etf_count < _ETF_MAX:
                 selected.append(sym)
                 etf_count += 1
@@ -431,46 +493,60 @@ def _apply_sector_caps(ranked: list) -> list:
 # §13.3-B — Correlation filter
 # ---------------------------------------------------------------------------
 
+def _daily_returns(symbol: str, ticker_data: dict, memo: dict):
+    """Trailing-1yr daily returns for *symbol*, computed at most once per run."""
+    if symbol not in memo:
+        d = ticker_data.get(symbol)
+        hist = d.get("history") if d else None
+        if hist is None or hist.empty:
+            memo[symbol] = None
+        else:
+            memo[symbol] = hist["Close"].pct_change().tail(252)
+    return memo[symbol]
+
+
+def _corr_matrix(symbols: list, ticker_data: dict, memo: dict):
+    """Correlation matrix over *symbols*, or None if fewer than 2 are usable."""
+    returns = {}
+    for s in symbols:
+        r = _daily_returns(s, ticker_data, memo)
+        if r is not None:
+            returns[s] = r
+    if len(returns) < 2:
+        return None
+    return pd.DataFrame(returns).corr()
+
+
 def _apply_correlation_filter(
     selected: list,
     ranked: list,
     ticker_data: dict,
     scores: dict,
+    memo: dict | None = None,
 ) -> list:
     """Iteratively replace high-correlation pairs (> 0.70) with alternatives."""
     if len(selected) < 2:
         return selected
 
+    memo = memo if memo is not None else {}
+
     for _ in range(_MAX_CORR_PASSES):
         try:
-            returns = {
-                s: ticker_data[s]["history"]["Close"].pct_change().tail(252)
-                for s in selected
-                if s in ticker_data and not ticker_data[s]["history"].empty
-            }
-            if len(returns) < 2:
+            corr = _corr_matrix(selected, ticker_data, memo)
+            if corr is None or corr.isnull().all().all():
                 break
 
-            corr = pd.DataFrame(returns).corr()
-            if corr.isnull().all().all():
+            # Worst offending pair = max over the strict upper triangle. Vectorised;
+            # the previous nested loop did O(n²) scalar .at[] lookups per pass.
+            vals = corr.to_numpy(copy=True)
+            vals[np.tril_indices_from(vals)] = np.nan
+            if np.all(np.isnan(vals)):
                 break
-
-            # Find worst offending pair above threshold
-            worst_pair = None
-            worst_val  = _CORR_THRESHOLD
-            for i, a in enumerate(selected):
-                for b in selected[i + 1:]:
-                    if a not in corr.index or b not in corr.columns:
-                        continue
-                    val = corr.at[a, b]
-                    if not pd.isna(val) and val > worst_val:
-                        worst_val  = val
-                        worst_pair = (a, b)
-
-            if worst_pair is None:
+            i, j = np.unravel_index(np.nanargmax(vals), vals.shape)
+            if not vals[i, j] > _CORR_THRESHOLD:
                 break  # all pairs within threshold
 
-            a, b = worst_pair
+            a, b = corr.index[i], corr.columns[j]
             to_remove = (
                 b if scores[a]["macro_adjusted_quality"] >= scores[b]["macro_adjusted_quality"]
                 else a
@@ -486,7 +562,10 @@ def _apply_correlation_filter(
             selected = [s for s in selected if s != to_remove]
             if replacement:
                 selected.append(replacement)
-                selected = [s for s in ranked if s in set(selected)]  # restore rank order
+                # Restore rank order. The set is hoisted out of the comprehension —
+                # it used to be rebuilt once per element of `ranked`.
+                sel_set  = set(selected)
+                selected = [s for s in ranked if s in sel_set]
 
         except Exception as exc:
             logger.warning("Correlation filter pass failed: %s — skipping.", exc)
@@ -504,6 +583,7 @@ def _apply_currency_balance(
     ranked: list,
     user_risk: int,
     scores: dict,
+    ticker_data: dict | None = None,
 ) -> list:
     """Ensure a minimum number of TSX-listed (CAD) picks per risk band."""
     if user_risk >= 7:
@@ -511,10 +591,7 @@ def _apply_currency_balance(
 
     min_cad = 3 if user_risk <= 3 else 2
 
-    def _is_cad(sym: str) -> bool:
-        return EXCHANGE_MAP.get(sym, "NYSE") == "TSX"
-
-    cad_count    = sum(1 for s in selected if _is_cad(s))
+    cad_count    = sum(1 for s in selected if _is_cad(s, ticker_data))
     selected_set = set(selected)
 
     for candidate in ranked:
@@ -542,28 +619,49 @@ def _apply_currency_balance(
 # §13.4 — Portfolio weights
 # ---------------------------------------------------------------------------
 
+_MIN_WEIGHT_PCT = 1   # every pick that earns a page earns an allocation
+
+
 def _compute_weights(selected: list, scores: dict) -> dict:
-    """Return {sym: weight_pct} as int multiples of 5, summing to 100."""
+    """Return {sym: weight_pct} as whole percents summing to exactly 100.
+
+    Uses the largest-remainder method on a 1% grid. The previous implementation
+    rounded each weight to a 5% grid and dumped the entire residual on the largest
+    position, which produced negative weights once the pick count grew: 23 picks
+    cannot fit a 5% grid (23 x 5 = 115), so the residual went below zero.
+    """
     n = len(selected)
     if n == 0:
         return {}
+    if n >= 100:
+        # Below the resolution of a whole-percent grid; split as evenly as possible.
+        base = {s: 100 // n for s in selected}
+        for s in selected[: 100 - sum(base.values())]:
+            base[s] += 1
+        return base
 
     qualities = [scores[s]["macro_adjusted_quality"] for s in selected]
     mean_q    = sum(qualities) / n or 1.0
 
     raw   = {s: (1.0 / n) * (scores[s]["macro_adjusted_quality"] / mean_q) for s in selected}
-    total = sum(raw.values())
+    total = sum(raw.values()) or 1.0
     pcts  = {s: raw[s] / total * 100 for s in selected}
 
-    rounded = {s: round(pcts[s] / 5) * 5 for s in selected}
+    # Reserve the floor first, then apportion what's left by largest remainder so
+    # the floor can never push the total past 100.
+    floor_total = _MIN_WEIGHT_PCT * n
+    spare       = 100 - floor_total
+    scaled      = {s: pcts[s] / 100 * spare for s in selected}
 
-    # Absorb rounding error into largest position
-    diff    = 100 - sum(rounded.values())
-    if diff != 0:
-        largest = max(rounded, key=lambda s: rounded[s])
-        rounded[largest] += diff
+    weights   = {s: _MIN_WEIGHT_PCT + int(scaled[s]) for s in selected}
+    remaining = 100 - sum(weights.values())
 
-    return rounded
+    # Hand the leftover points to the largest fractional parts (ties by rank order).
+    order = sorted(selected, key=lambda s: (-(scaled[s] - int(scaled[s])), selected.index(s)))
+    for s in order[:remaining]:
+        weights[s] += 1
+
+    return weights
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +678,8 @@ def _assemble_pick(
     fundamentals: dict,
     forecasts: dict,
     sentiments: dict,
+    is_etf: bool | None = None,
+    is_cad: bool | None = None,
 ) -> dict:
     rs = risk_scores.get(sym,   {}) or {}
     rm = risk_metrics.get(sym,  {}) or {}
@@ -601,8 +701,12 @@ def _assemble_pick(
 
     return {
         "symbol":                  sym,
-        "is_etf":                  sym in ETF_TICKERS,
+        "is_etf":                  (sym in ETF_TICKERS) if is_etf is None else is_etf,
+        "currency":                ("CAD" if is_cad else "USD") if is_cad is not None else None,
         "risk_score":              rs.get("risk_score"),
+        # Per-component sub-scores from risk_scorer.score_ticker — drives the
+        # risk-score breakdown chart on the ticker page.
+        "risk_score_components":   rs.get("components") or {},
         "quality_score":           score_info["quality_score"],
         "macro_adjusted_quality":  score_info["macro_adjusted_quality"],
         "weight":                  weight,
@@ -624,43 +728,57 @@ def _assemble_pick(
 # ---------------------------------------------------------------------------
 
 def _compute_portfolio_cost(picks: list, amount: int, platform: str) -> dict:
-    total_trading  = 0.0
-    total_fx       = 0.0
+    # Commissions are quoted in the listing currency, so CAD and USD fees are
+    # tracked separately rather than summed into one misleading "CAD" total.
+    trading_cad = 0.0
+    trading_usd = 0.0
+    total_fx    = 0.0
     total_etf_drag = 0.0
     etf_breakdown: list[dict] = []
+    unknown_mer: list[str] = []
 
     for pick in picks:
         w    = pick.get("weight", 0)
         cost = pick.get("cost", {}) or {}
         pos  = amount * (w / 100)
 
-        exp_ratio = cost.get("expense_ratio", 0.0) or 0.0
-        trading   = cost.get("trading_cost_cad", 0.0) or 0.0
+        exp_ratio = cost.get("expense_ratio")          # None when unknown
+        trading   = cost.get("trading_cost") or 0.0
+        currency  = cost.get("trading_cost_currency") or "CAD"
         fx_applic = cost.get("fx_conversion_applicable", False)
 
-        drag    = pos * exp_ratio
-        fx_cost = pos * 0.015 if fx_applic else 0.0
+        if currency == "CAD":
+            trading_cad += trading
+        else:
+            trading_usd += trading
 
-        total_trading  += trading
-        total_fx       += fx_cost
-        total_etf_drag += drag
+        total_fx += pos * 0.015 if fx_applic else 0.0
 
-        if exp_ratio > 0:
+        if exp_ratio:
+            drag = pos * exp_ratio
+            total_etf_drag += drag
             etf_breakdown.append({
-                "symbol":                 pick["symbol"],
-                "mer_pct":               f"{exp_ratio * 100:.2f}%",
+                "symbol":                  pick["symbol"],
+                "mer_pct":                 f"{exp_ratio * 100:.2f}%",
                 "annual_drag_on_position": round(drag, 2),
             })
+        elif pick.get("is_etf"):
+            unknown_mer.append(pick["symbol"])
 
-    avg_mer = total_etf_drag / amount if amount > 0 else 0.0
-    if avg_mer <= 0.001:
-        eff = "Excellent"
-    elif avg_mer <= 0.0025:
-        eff = "Good"
-    elif avg_mer <= 0.006:
-        eff = "Fair"
+    # Only meaningful if at least one ETF reported a real MER.
+    if etf_breakdown:
+        avg_mer = total_etf_drag / amount if amount > 0 else 0.0
+        if avg_mer <= 0.001:
+            eff = "Excellent"
+        elif avg_mer <= 0.0025:
+            eff = "Good"
+        elif avg_mer <= 0.006:
+            eff = "Fair"
+        else:
+            eff = "Poor"
     else:
-        eff = "Poor"
+        avg_mer = None
+        eff     = None
 
     _platform_notes = {
         "questrade":    "ETF buys are free on Questrade. USD positions incur ~1.5% FX conversion.",
@@ -670,13 +788,14 @@ def _compute_portfolio_cost(picks: list, amount: int, platform: str) -> dict:
 
     return {
         "assumed_portfolio_cad":       amount,
-        "total_one_time_trading_cost": round(total_trading, 2),
+        "trading_cost_cad":            round(trading_cad, 2),
+        "trading_cost_usd":            round(trading_usd, 2),
         "total_fx_conversion_cost":    round(total_fx, 2),
-        "total_upfront_cost":          round(total_trading + total_fx, 2),
-        "annual_etf_drag_cad":         round(total_etf_drag, 2),
-        "annual_etf_drag_pct":         round(avg_mer * 100, 4),
+        "annual_etf_drag_cad":         round(total_etf_drag, 2) if etf_breakdown else None,
+        "annual_etf_drag_pct":         round(avg_mer * 100, 4) if avg_mer is not None else None,
         "etf_cost_efficiency":         eff,
         "cost_efficiency_breakdown":   etf_breakdown,
+        "etfs_missing_mer":            unknown_mer,
         "platform":                    platform,
         "note":                        _platform_notes.get(platform, ""),
     }
@@ -686,25 +805,15 @@ def _compute_portfolio_cost(picks: list, amount: int, platform: str) -> dict:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _avg_portfolio_corr(selected: list, ticker_data: dict) -> float | None:
-    """Average pairwise Pearson correlation of 1yr returns across selected picks."""
+def _avg_portfolio_corr(corr) -> float | None:
+    """Average pairwise correlation from a prebuilt matrix (upper triangle)."""
+    if corr is None or corr.empty:
+        return None
     try:
-        returns = {
-            s: ticker_data[s]["history"]["Close"].pct_change().tail(252)
-            for s in selected
-            if s in ticker_data and not ticker_data[s]["history"].empty
-        }
-        if len(returns) < 2:
-            return None
-        corr = pd.DataFrame(returns).corr()
-        syms = list(returns.keys())
-        vals = [
-            corr.at[a, b]
-            for i, a in enumerate(syms)
-            for b in syms[i + 1:]
-            if not pd.isna(corr.at[a, b])
-        ]
-        return round(sum(vals) / len(vals), 4) if vals else None
+        vals  = corr.to_numpy()
+        pairs = vals[np.triu_indices_from(vals, k=1)]
+        pairs = pairs[~np.isnan(pairs)]
+        return round(float(pairs.mean()), 4) if pairs.size else None
     except Exception:
         return None
 
@@ -715,6 +824,7 @@ def _empty_output(macro_context: dict) -> dict:
         "sector_breakdown":    {},
         "currency_breakdown":  {"CAD": 0, "USD": 0},
         "avg_portfolio_corr":  None,
+        "correlation_matrix":  None,
         "total_picks":         0,
         "macro_context":       macro_context,
         "portfolio_cost":      {},
@@ -820,7 +930,12 @@ def engine_demo(user_risk: int = 5) -> None:
 
     cost = result["portfolio_cost"]
     print(f"\nPortfolio cost (${cost.get('assumed_portfolio_cad', 0):,} CAD):")
-    print(f"  One-time trading + FX : ${cost.get('total_upfront_cost', 0):.2f}")
-    print(f"  Annual ETF drag        : ${cost.get('annual_etf_drag_cad', 0):.2f} "
-          f"({cost.get('annual_etf_drag_pct', 0):.3f}%)")
+    print(f"  Commissions            : ${cost.get('trading_cost_cad', 0):.2f} CAD"
+          f" + ${cost.get('trading_cost_usd', 0):.2f} USD")
+    print(f"  FX conversion          : ${cost.get('total_fx_conversion_cost', 0):.2f} CAD")
+    drag, drag_pct = cost.get("annual_etf_drag_cad"), cost.get("annual_etf_drag_pct")
+    print(f"  Annual ETF drag        : "
+          + (f"${drag:.2f} ({drag_pct:.3f}%)" if drag is not None else "not available"))
+    if cost.get("etfs_missing_mer"):
+        print(f"    (MER unavailable for: {', '.join(cost['etfs_missing_mer'])})")
     print(f"  Note: {cost.get('note', '')}")

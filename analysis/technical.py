@@ -88,29 +88,52 @@ def _rsi(close: pd.Series, period: int = 14) -> dict:
 # §6.3  Multi-period returns
 # ---------------------------------------------------------------------------
 
+# Calendar offsets rather than trading-day counts. Trading days per year vary by
+# exchange and holiday calendar, so a fixed count is fragile: the old 1260-day
+# lookback for 5y was unreachable from a period="5y" fetch (which returns ~1254
+# bars), making return_5y None for every ticker on every report.
 _RETURN_PERIODS = [
-    ("return_1m",  21),
-    ("return_3m",  63),
-    ("return_1y",  252),
-    ("return_3y",  756),
-    ("return_5y",  1260),
+    ("return_1m",  pd.DateOffset(months=1)),
+    ("return_3m",  pd.DateOffset(months=3)),
+    ("return_1y",  pd.DateOffset(years=1)),
+    ("return_3y",  pd.DateOffset(years=3)),
+    ("return_5y",  pd.DateOffset(years=5)),
 ]
+
+# How far before the target date we'll accept a bar, to absorb weekends/holidays
+# without silently reporting a materially shorter period.
+_ASOF_TOLERANCE = pd.Timedelta(days=10)
 
 
 def _returns(close: pd.Series) -> dict:
-    result = {}
-    if close.empty:
-        return {key: None for key, _ in _RETURN_PERIODS}
+    result = {key: None for key, _ in _RETURN_PERIODS}
+    if close.empty or not isinstance(close.index, pd.DatetimeIndex):
+        return result
 
-    last = float(close.iloc[-1])
-    n = len(close)
+    close = close.sort_index()
+    last_date = close.index[-1]
+    last      = float(close.iloc[-1])
+    first     = close.index[0]
 
-    for key, lookback in _RETURN_PERIODS:
-        if n < lookback:
-            result[key] = None
-        else:
-            past = float(close.iloc[-lookback])
-            result[key] = round((last / past) - 1, 6) if past != 0 else None
+    for key, offset in _RETURN_PERIODS:
+        target = last_date - offset
+        # Not enough history to cover this period at all.
+        if target < first - _ASOF_TOLERANCE:
+            continue
+
+        idx = close.index.asof(target)
+        if pd.isna(idx):
+            # Target falls just before the first bar — a period="5y" fetch starts
+            # a day or two after the exact 5-year mark. Within tolerance, measure
+            # from the earliest bar we have rather than reporting nothing.
+            idx = first
+        elif target - idx > _ASOF_TOLERANCE:
+            # Nearest earlier bar is far older than asked for.
+            continue
+
+        past = float(close.loc[idx])
+        if past != 0:
+            result[key] = round((last / past) - 1, 6)
 
     return result
 

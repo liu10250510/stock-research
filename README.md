@@ -82,6 +82,7 @@ python main.py --risk 5 --include NVDA --exclude TSLA
 | `--sectors` | all | Space-separated sector names to restrict the pool |
 | `--include` | — | Force-include these symbols |
 | `--exclude` | — | Force-exclude these symbols |
+| `--no-cache` | — | Bypass the 15-minute market-data cache and always fetch fresh |
 | `--verbose` | — | Show INFO-level log messages |
 
 ## Web UI + API

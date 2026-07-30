@@ -88,7 +88,9 @@ def score_ticker(ticker_data: dict, spy_history=None) -> dict:
     final = sum(components[k] * weights[k] for k in components)
     final = round(max(1.0, min(10.0, final)), 2)
 
-    return {"risk_score": final, "components": components}
+    # beta is returned so compute_fundamentals can reuse it instead of repeating
+    # _calc_beta, which is the expensive path whenever info['beta'] is missing.
+    return {"risk_score": final, "components": components, "beta": beta}
 
 
 # ---------------------------------------------------------------------------
@@ -174,13 +176,30 @@ def _get_beta(info: dict, history, spy_history, symbol: str = "") -> float | Non
     return _calc_beta(history, spy_history, symbol)
 
 
+_SPY_RET_CACHE: tuple | None = None
+
+
+def _spy_returns(spy_history):
+    """Trailing-252d SPY returns, memoised on the baseline Series identity.
+
+    The SPY baseline is a single invariant Series shared across the whole
+    universe, but this was previously re-differenced once per ticker.
+    """
+    global _SPY_RET_CACHE
+    if _SPY_RET_CACHE is not None and _SPY_RET_CACHE[0] is spy_history:
+        return _SPY_RET_CACHE[1]
+    rets = spy_history.pct_change().dropna().tail(252)
+    _SPY_RET_CACHE = (spy_history, rets)
+    return rets
+
+
 def _calc_beta(history, spy_history, symbol: str = "") -> float | None:
     if spy_history is None or history is None or history.empty:
         return None
     try:
         close      = history["Close"].dropna()
         ticker_ret = close.pct_change().dropna().tail(252)
-        spy_ret    = spy_history.pct_change().dropna().tail(252)
+        spy_ret    = _spy_returns(spy_history)
         common     = ticker_ret.index.intersection(spy_ret.index)
         if len(common) < 30:
             return None

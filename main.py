@@ -14,6 +14,11 @@ import argparse
 import logging
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
+
+# DuckDuckGo rate-limits more aggressively than Yahoo, so the research pool is
+# deliberately smaller than the data-fetch pool.
+_WEB_WORKERS = 4
 
 logging.basicConfig(
     level=logging.WARNING,
@@ -48,6 +53,8 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Force-include these symbols (space-separated)")
     p.add_argument("--exclude", nargs="+", default=None,
                    help="Force-exclude these symbols (space-separated)")
+    p.add_argument("--no-cache", action="store_true",
+                   help="Bypass the local market-data cache and always fetch fresh")
     p.add_argument("--verbose", action="store_true",
                    help="Show INFO-level log messages")
     return p
@@ -75,14 +82,14 @@ def _run_pipeline(tickers: list, args, log, t0: float, custom_mode: bool = False
         log(f"  [{time.time() - t0:5.1f}s]  {msg}")
 
     # ── 2. Fetch market data ─────────────────────────────────────────────────
-    _step(f"Fetching data for {len(tickers)} tickers (this takes ~30–60 s)…")
+    _step(f"Fetching data for {len(tickers)} tickers…")
     from data.fetcher import DataFetcher
-    fetcher  = DataFetcher()
-    spy_hist = fetcher.spy_history
+    fetcher  = DataFetcher(use_cache=not getattr(args, "no_cache", False))
 
     if custom_mode:
-        # Resolve symbols: retry with .TO suffix for TSX-listed tickers
-        resolution = fetcher.resolve_symbols(tickers)
+        # Resolve symbols: retry with .TO suffix for TSX-listed tickers.
+        # resolve_symbols hands back the data it fetched, so we don't fetch twice.
+        resolution, prefetched = fetcher.resolve_symbols(tickers)
         resolved_tickers = []
         for orig in tickers:
             resolved = resolution.get(orig)
@@ -93,8 +100,11 @@ def _run_pipeline(tickers: list, args, log, t0: float, custom_mode: bool = False
                     log(f"         ℹ Resolved '{orig}' → '{resolved}'")
                 resolved_tickers.append(resolved)
         tickers = resolved_tickers
+        raw = {s: prefetched[s] for s in tickers if s in prefetched}
+    else:
+        raw = fetcher.fetch_all(tickers)
 
-    raw = fetcher.fetch_all(tickers)
+    spy_hist = fetcher.spy_history
 
     fetched = [s for s, d in raw.items()
                if d.get("history") is not None and not d["history"].empty]
@@ -122,22 +132,31 @@ def _run_pipeline(tickers: list, args, log, t0: float, custom_mode: bool = False
     for sym in fetched:
         data = raw[sym]
         hist = data["history"]
-        risk_scores[sym]  = score_ticker(data, spy_hist)
-        risk_metrics[sym] = compute_risk_metrics(data)
+        # technicals first: its return_1y feeds compute_risk_metrics, which would
+        # otherwise recompute the same figure.
         technicals[sym]   = compute_technicals(hist)
-        fundamentals[sym] = compute_fundamentals(data, spy_hist, args.platform)
+        risk_scores[sym]  = score_ticker(data, spy_hist)
+        risk_metrics[sym] = compute_risk_metrics(
+            data, return_1y=technicals[sym].get("return_1y")
+        )
+        fundamentals[sym] = compute_fundamentals(
+            data, spy_hist, args.platform, beta=risk_scores[sym].get("beta")
+        )
         forecasts[sym]    = compute_forecast(data)
 
     _step(f"  ✓ Scored {len(fetched)} tickers.")
 
-    # Free large DataFrames now that analysis is complete; trim history to 1yr
+    # Free large DataFrames now that analysis is complete, and trim history.
+    # 460 rows = 252 plotted days + the 200-day MA200 window that price_chart
+    # computes before slicing to the last year. Trimming to 252 here left MA200
+    # with only ~53 valid points, rendering it as a stub.
     for sym in fetched:
         d = raw[sym]
-        for key in ("balance_sheet", "income_stmt", "cashflow",
-                    "recommendations", "upgrades_downgrades", "funds_data"):
+        for key in ("balance_sheet", "income_stmt", "recommendations",
+                    "upgrades_downgrades", "funds_data"):
             d.pop(key, None)
         if d.get("history") is not None and not d["history"].empty:
-            d["history"] = d["history"].tail(252)
+            d["history"] = d["history"].tail(460)
 
     # ── 4. Web research (sentiment + risk factors) ───────────────────────────
     _step("Running web research (sentiment & risk factors)…")
@@ -146,15 +165,23 @@ def _run_pipeline(tickers: list, args, log, t0: float, custom_mode: bool = False
         "sentiment_label": "Neutral", "risk_factors": [],
         "sources": [], "source_scores": [],
     }
-    for i, sym in enumerate(fetched):
+    def _research(sym: str):
         name = DISPLAY_NAMES.get(sym, sym)
         try:
-            sentiments[sym] = web_search(sym, name)
+            return sym, web_search(sym, name)
         except Exception as exc:
             logger.warning("%s: web search failed: %s", sym, exc)
-            sentiments[sym] = _NEUTRAL_SENTIMENT
-        if (i + 1) % 5 == 0:
-            _step(f"    {i+1}/{len(fetched)} web searches done…")
+            return sym, dict(_NEUTRAL_SENTIMENT)
+
+    # Network-bound and independent per ticker. Kept well below the fetch pool
+    # size — DuckDuckGo throttles harder than Yahoo.
+    done = 0
+    with ThreadPoolExecutor(max_workers=min(_WEB_WORKERS, len(fetched))) as pool:
+        for sym, result in pool.map(_research, fetched):
+            sentiments[sym] = result
+            done += 1
+            if done % 5 == 0:
+                _step(f"    {done}/{len(fetched)} web searches done…")
 
     _step("  ✓ Web research complete.")
 

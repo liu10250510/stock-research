@@ -28,6 +28,9 @@ try:
 except ImportError:
     _cache = None  # type: ignore[assignment]
 
+# Politeness delay applied per real network query (never on a cache hit).
+_QUERY_DELAY = 0.5
+
 # ---------------------------------------------------------------------------
 # §12.2  Sector sensitivity matrix
 # Tuple order: (rates_rising, rates_falling, high_inflation, recession)
@@ -149,9 +152,8 @@ def _run_macro_searches() -> list:
         "Canada inflation rate GDP growth 2026",
     ]
     snippets: list[str] = []
-    for i, q in enumerate(queries):
-        if i > 0:
-            time.sleep(0.5)
+    for q in queries:
+        # Delay lives inside _ddg_search, after the cache check.
         snippets.extend(_ddg_search(q))
     return snippets
 
@@ -163,6 +165,9 @@ def _ddg_search(query: str) -> list:
         if cached is not None:
             logger.debug("Cache hit for macro query: %s", query[:60])
             return cached
+
+    # Only real network calls pay the politeness delay.
+    time.sleep(_QUERY_DELAY)
 
     snippets: list = []
 
@@ -191,7 +196,9 @@ def _ddg_search(query: str) -> list:
         except Exception as exc:
             logger.warning("macro DDG fallback failed: %s", exc)
 
-    if snippets and _cache is not None:
+    # Empty results are cached too (on a shorter TTL) so a failing query isn't
+    # re-run in full on every future run.
+    if _cache is not None:
         _cache.put(query, snippets)
 
     return snippets

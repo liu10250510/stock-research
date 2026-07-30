@@ -19,12 +19,17 @@ Usage:
 import logging
 import math
 
-import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-RISK_FREE_RATE = 0.035   # ~3.5% CAD overnight rate (BoC; hardcoded, noted in report)
+RISK_FREE_RATE = 0.035   # ~3.5% CAD overnight rate (BoC); surfaced on the PDF cover.
+                         # One rate is applied to both CAD- and USD-denominated
+                         # assets, which is an approximation.
+
+# Trailing window for the Sharpe/Sortino denominators — matched to the 1-year
+# return in their numerator.
+_WINDOW_1Y = 252
 
 
 # ---------------------------------------------------------------------------
@@ -61,12 +66,18 @@ def compute_risk_metrics(ticker_data: dict, return_1y: float | None = None) -> d
     if len(daily_ret) < 30:
         return empty
 
-    ann_vol = _annualized_vol(daily_ret)
-    ret_1y  = return_1y if return_1y is not None else _return_1y(close)
+    # Sharpe and Sortino both use a 1-year return in the numerator, so both
+    # denominators are measured over the same trailing year. Previously the
+    # volatility came from a 30-day window and the downside deviation from the
+    # full 5-year history — three different periods in one table, which left
+    # e.g. XIU.TO's Sharpe overstated by ~35%.
+    ret_1y      = return_1y if return_1y is not None else _return_1y(close)
+    window      = daily_ret.tail(_WINDOW_1Y)
+    ann_vol     = _annualized_vol(window)
 
     sharpe  = _sharpe(ret_1y, ann_vol)
-    sortino = _sortino(ret_1y, daily_ret)
-    max_dd  = _max_drawdown(close)
+    sortino = _sortino(ret_1y, window)
+    max_dd  = _max_drawdown(daily_ret)   # drawdown intentionally spans all history
 
     return {
         "sharpe_ratio":  sharpe,
@@ -81,7 +92,10 @@ def compute_risk_metrics(ticker_data: dict, return_1y: float | None = None) -> d
 # ---------------------------------------------------------------------------
 
 def _annualized_vol(daily_ret: pd.Series) -> float | None:
-    vol = float(daily_ret.tail(30).std()) * math.sqrt(252)
+    """Annualized volatility of the supplied return series (no further slicing)."""
+    if len(daily_ret) < 2:
+        return None
+    vol = float(daily_ret.std()) * math.sqrt(252)
     return round(vol, 6) if not math.isnan(vol) else None
 
 
@@ -111,10 +125,11 @@ def _sortino(ret_1y, daily_ret: pd.Series) -> float | None:
     return round((ret_1y - RISK_FREE_RATE) / downside_dev, 4)
 
 
-def _max_drawdown(close: pd.Series) -> float | None:
-    if len(close) < 2:
+def _max_drawdown(daily_ret: pd.Series) -> float | None:
+    """Max drawdown from an already-computed daily return series."""
+    if len(daily_ret) < 1:
         return None
-    cum_ret     = (1 + close.pct_change().dropna()).cumprod()
+    cum_ret     = (1 + daily_ret).cumprod()
     rolling_max = cum_ret.cummax()
     drawdown    = (cum_ret - rolling_max) / rolling_max
     dd = float(drawdown.min())
