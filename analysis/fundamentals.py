@@ -51,6 +51,7 @@ def compute_fundamentals(
     ticker_data: dict,
     spy_history=None,
     platform: str = "questrade",
+    beta=None,
 ) -> dict:
     """Return a flat fundamentals dict for one ticker.
 
@@ -59,6 +60,8 @@ def compute_fundamentals(
         spy_history:  Close Series (1yr) from DataFetcher.spy_history; used for
                       beta fallback when info['beta'] is missing.
         platform:     One of "questrade", "wealthsimple", "td_direct".
+        beta:         Pre-computed beta from risk_scorer.score_ticker. If None,
+                      it is derived here.
 
     Returns:
         Dict with all §7 fields.  Missing values are None.
@@ -67,16 +70,20 @@ def compute_fundamentals(
     is_etf   = ticker_data["is_etf"]
     info     = ticker_data.get("info") or {}
     history  = ticker_data.get("history")
-    exchange = EXCHANGE_MAP.get(symbol, "NYSE")
+    # Resolved from Yahoo's own listing data by the fetcher; the static map only
+    # covers the 86-name pool and would call every custom symbol USD-listed.
+    exchange = ticker_data.get("exchange") or EXCHANGE_MAP.get(symbol, "NYSE")
 
-    beta = _get_beta(info, history, spy_history, symbol)
+    if beta is None:
+        beta = _get_beta(info, history, spy_history, symbol)
 
     if is_etf:
         result = _etf_fundamentals(ticker_data, info, beta, symbol)
     else:
         result = _stock_fundamentals(ticker_data, info, beta, symbol)
 
-    result["cost"] = compute_costs(info, is_etf, exchange, platform)
+    result["cost"] = compute_costs(info, is_etf, exchange, platform,
+                                   funds_data=ticker_data.get("funds_data"))
     return result
 
 
@@ -85,36 +92,89 @@ def compute_costs(
     is_etf: bool,
     exchange: str,
     platform: str = "questrade",
+    funds_data=None,
 ) -> dict:
-    """Return the §7.3 cost sub-dict for any ticker."""
+    """Return the §7.3 cost sub-dict for any ticker.
+
+    An unknown MER is reported as None, never as 0.0. Yahoo has no expense ratio
+    for many TSX-listed ETFs, and the previous `or 0.0` fallback made every one of
+    them look free and earned it an "Excellent" cost grade.
+    """
     platform = platform if platform in TRADING_COSTS else "questrade"
     costs = TRADING_COSTS[platform]
     is_cad = exchange == "TSX"
 
     if is_etf:
-        mer = info.get("annualReportExpenseRatio") or info.get("totalExpenseRatio") or 0.0
-        mer = float(mer)
-        annual_drag = round(10_000 * mer, 2)
+        mer         = _etf_expense_ratio(info, funds_data)
+        annual_drag = round(10_000 * mer, 2) if mer is not None else None
         efficiency  = _mer_efficiency(mer)
         trading_cad = costs["cad_etf"] if is_cad else costs["usd_etf"]
     else:
-        mer         = 0.0
-        annual_drag = 0.0
-        efficiency  = "Excellent"
+        # A stock has no MER — absent, not zero, and not a grade.
+        mer         = None
+        annual_drag = None
+        efficiency  = None
         trading_cad = costs["cad_stock"] if is_cad else costs["usd_stock"]
 
     fx_applicable = not is_cad
+    currency      = "CAD" if is_cad else "USD"
 
     return {
         "expense_ratio":          mer,
-        "expense_ratio_pct":      f"{mer * 100:.2f}%",
+        "expense_ratio_pct":      f"{mer * 100:.2f}%" if mer is not None else None,
         "annual_drag_per_10k":    annual_drag,
         "cost_efficiency":        efficiency,
-        "trading_cost_cad":       trading_cad,
-        "trading_cost_usd":       trading_cad,   # stored in native currency; label clarifies
+        "trading_cost":           trading_cad,
+        "trading_cost_currency":  currency,
+        "trading_cost_cad":       trading_cad if is_cad else None,
+        "trading_cost_usd":       None if is_cad else trading_cad,
         "fx_conversion_applicable": fx_applicable,
         "fx_conversion_cost_pct": "1.50%" if fx_applicable else "0.00%",
     }
+
+
+def _etf_expense_ratio(info: dict, funds_data) -> float | None:
+    """MER as a decimal (0.0009 = 0.09%), or None when Yahoo doesn't have it.
+
+    Order: funds_data.fund_operations (a decimal), then info['netExpenseRatio']
+    (expressed as a *percent*, e.g. 0.0945 means 0.0945%). Note that
+    fund_operations reports 0.0000 for many TSX ETFs (XIU.TO, ZAG.TO), which is
+    missing data rather than a free fund — hence the `> 0` test.
+    """
+    try:
+        if funds_data is not None:
+            ops = funds_data.fund_operations
+            if ops is not None and not ops.empty:
+                for label in ("Annual Report Expense Ratio", "Expense Ratio"):
+                    if label in ops.index:
+                        for col in ops.columns:
+                            v = ops.loc[label, col]
+                            if v is not None and not pd.isna(v) and float(v) > 0:
+                                return float(v)
+                        break
+    except Exception as exc:
+        logger.debug("fund_operations expense ratio lookup failed: %s", exc)
+
+    net = info.get("netExpenseRatio")
+    if net is not None:
+        try:
+            v = float(net)
+            if v > 0:
+                return v / 100.0   # stored as a percent
+        except (TypeError, ValueError):
+            pass
+
+    for key in ("annualReportExpenseRatio", "totalExpenseRatio"):
+        v = info.get(key)
+        if v is not None:
+            try:
+                fv = float(v)
+                if fv > 0:
+                    return fv
+            except (TypeError, ValueError):
+                pass
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -270,24 +330,24 @@ def _etf_fundamentals(ticker_data: dict, info: dict, beta, symbol: str) -> dict:
     name        = info.get("longName") or DISPLAY_NAMES.get(symbol, symbol)
     description = info.get("longBusinessSummary")
     aum         = info.get("totalAssets")
-    mer         = info.get("annualReportExpenseRatio") or info.get("totalExpenseRatio")
+    # Same resolution order as compute_costs, so the MER shown in the fundamentals
+    # table can't disagree with the one in the cost table on the same page.
+    mer         = _etf_expense_ratio(info, funds_data)
     dist_yield  = info.get("yield") or _pct_to_dec(info.get("dividendYield"))
 
     top_holdings  = _etf_top_holdings(funds_data)
     sector_weights = _etf_sector_weights(funds_data)
-    geographic_data = _etf_geographic(funds_data)
     dist_history  = _distribution_history(dividends, quarters=8)
 
     return {
         "name":               name,
         "description":        description,
         "aum":                float(aum) if aum is not None else None,
-        "expense_ratio_raw":  float(mer) if mer is not None else None,
+        "expense_ratio_raw":  mer,
         "distribution_yield": float(dist_yield) if dist_yield is not None else None,
         "beta":               beta,
         "top_holdings":       top_holdings,
         "sector_weights":     sector_weights,
-        "geographic_data":    geographic_data,
         "distribution_history": dist_history,
     }
 
@@ -325,17 +385,6 @@ def _etf_sector_weights(funds_data) -> dict:
         return {}
 
 
-def _etf_geographic(funds_data):
-    if funds_data is None:
-        return None
-    try:
-        geo = funds_data.equity_holdings
-        return geo
-    except Exception as exc:
-        logger.debug("equity_holdings parse error: %s", exc)
-        return None
-
-
 def _distribution_history(dividends, quarters: int = 8) -> dict:
     """Return last *quarters* quarterly distribution totals keyed by YYYY-Q#."""
     if dividends is None or dividends.empty:
@@ -353,7 +402,11 @@ def _distribution_history(dividends, quarters: int = 8) -> dict:
 
 
 
-def _mer_efficiency(mer: float) -> str:
+def _mer_efficiency(mer: float | None) -> str | None:
+    # No MER means no grade. Returning "Excellent" for missing data made every
+    # TSX ETF look like the cheapest fund on the market.
+    if mer is None or mer <= 0:
+        return None
     if mer <= 0.0010:
         return "Excellent"
     if mer <= 0.0025:

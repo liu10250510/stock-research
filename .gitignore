@@ -39,6 +39,9 @@ logs/
 # Search result cache (24-hour TTL, reproducibility aid)
 .search_cache/
 
+# Market data cache (15-minute TTL, matches Yahoo's quote delay)
+.market_cache/
+
 # claude files
 CLAUDE.md
 SPEC.md

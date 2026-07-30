@@ -18,7 +18,6 @@ Usage:
 """
 
 import logging
-from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
@@ -33,6 +32,7 @@ GRADE_MAP = {
     "Strong Buy":    "buy",
     "Buy":           "buy",
     "Outperform":    "buy",
+    "Outperformer":  "buy",
     "Overweight":    "buy",
     "Market Outperform": "buy",
     "Sector Outperform": "buy",
@@ -45,6 +45,9 @@ GRADE_MAP = {
     "Equal-Weight":  "hold",
     "In-Line":       "hold",
     "Perform":       "hold",
+    "Sector Weight": "hold",
+    "Market Weight": "hold",
+    "Peer Perform":  "hold",
     # sell
     "Sell":          "sell",
     "Underperform":  "sell",
@@ -53,6 +56,17 @@ GRADE_MAP = {
     "Market Underperform": "sell",
     "Sector Underperform": "sell",
     "Negative":      "sell",
+    "Reduce":        "sell",
+}
+
+# Yahoo's recommendationKey -> the report's label vocabulary.
+_RECOMMENDATION_KEY_LABEL = {
+    "strong_buy":  "Strong Buy",
+    "buy":         "Buy",
+    "hold":        "Hold",
+    "underperform": "Sell",
+    "sell":        "Sell",
+    "strong_sell": "Sell",
 }
 
 
@@ -77,7 +91,8 @@ def compute_forecast(ticker_data: dict) -> dict:
     """
     info    = ticker_data.get("info") or {}
     history = ticker_data.get("history")
-    recs    = ticker_data.get("upgrades_downgrades")   # per-firm grade history
+    trend   = ticker_data.get("recommendations")       # current analyst counts
+    changes = ticker_data.get("upgrades_downgrades")   # rating-change log
 
     current_price = _current_price(history)
     model_a       = _model_a(current_price, info)
@@ -88,7 +103,24 @@ def compute_forecast(ticker_data: dict) -> dict:
     if forecast_3m is not None and current_price:
         upside_pct = round((forecast_3m / current_price - 1) * 100, 2)
 
-    consensus = _analyst_consensus(recs)
+    # The analyst target's own implication, on its own 12-month horizon. Kept
+    # separate from the blended 3-month projection above, which is not an
+    # analyst figure and for ETFs contains no analyst input at all.
+    target_mean    = info.get("targetMeanPrice")
+    analyst_upside = None
+    if target_mean and current_price:
+        analyst_upside = round((float(target_mean) / current_price - 1) * 100, 2)
+
+    if model_a is not None and model_b is not None:
+        basis = "blend"
+    elif model_a is not None:
+        basis = "analyst"
+    elif model_b is not None:
+        basis = "momentum"
+    else:
+        basis = None
+
+    consensus = _analyst_consensus(trend, changes, info)
 
     return {
         "current_price":    round(current_price, 4) if current_price else None,
@@ -98,6 +130,9 @@ def compute_forecast(ticker_data: dict) -> dict:
         "forecast_low":     info.get("targetLowPrice"),
         "model_a":          round(model_a, 4) if model_a else None,
         "model_b":          round(model_b, 4) if model_b else None,
+        "forecast_basis":   basis,
+        "analyst_target":   float(target_mean) if target_mean else None,
+        "analyst_upside_pct": analyst_upside,
         "analyst_count":    consensus["analyst_count"],
         "buy_count":        consensus["buy_count"],
         "hold_count":       consensus["hold_count"],
@@ -149,8 +184,22 @@ def _combine(model_a, model_b):
 # §9.4  Analyst consensus aggregation
 # ---------------------------------------------------------------------------
 
-def _analyst_consensus(recs) -> dict:
-    empty = {
+def _analyst_consensus(trend, changes, info: dict | None = None) -> dict:
+    """Current analyst consensus, plus 30-day rating momentum.
+
+    Counts come from Yahoo's recommendationTrend (`ticker.recommendations`), which
+    is a snapshot of how many analysts currently hold each rating. The label
+    prefers Yahoo's own `recommendationKey`.
+
+    This deliberately does NOT count rows in `upgrades_downgrades`: that frame logs
+    rating *changes*, so counting a 90-day window of it both missed analysts who
+    hadn't changed their rating (11 of 12 TSX names reported zero coverage) and
+    double-counted firms that acted twice. It is used here only for the 30-day
+    upgrade/downgrade tallies, which is what a change log is actually good for.
+    """
+    info = info or {}
+
+    result = {
         "analyst_count": 0,
         "buy_count":     0,
         "hold_count":    0,
@@ -160,79 +209,111 @@ def _analyst_consensus(recs) -> dict:
         "consensus_label":   "Insufficient Data",
     }
 
-    if recs is None or (hasattr(recs, "empty") and recs.empty):
-        return empty
+    # ── Counts from recommendationTrend ─────────────────────────────────────
+    counts = _trend_counts(trend)
+    if counts is not None:
+        result.update(counts)
 
-    df = recs.copy()
+    # ── 30-day rating momentum from the change log ──────────────────────────
+    result.update(_rating_momentum(changes))
 
-    # Normalise index to tz-naive
-    if hasattr(df.index, "tz") and df.index.tz is not None:
-        df.index = df.index.tz_localize(None)
+    # ── Label: prefer Yahoo's own consensus key ─────────────────────────────
+    key   = (info.get("recommendationKey") or "").strip().lower()
+    label = _RECOMMENDATION_KEY_LABEL.get(key)
 
-    # Identify grade columns — yfinance uses "ToGrade"/"FromGrade" (camelCase)
-    # or "To Grade"/"From Grade" depending on version; normalise to find either
-    col_map  = {c.lower().replace(" ", "").replace("_", ""): c for c in df.columns}
-    to_col   = col_map.get("tograde")
-    from_col = col_map.get("fromgrade")
+    total = result["analyst_count"]
+    if label is None and total >= 3:
+        # Fallback: derive from the counts we have.
+        buy, hold, sell = result["buy_count"], result["hold_count"], result["sell_count"]
+        if buy / total > 0.70:
+            label = "Strong Buy"
+        elif buy / total > 0.50:
+            label = "Buy"
+        elif hold / total > 0.50:
+            label = "Hold"
+        elif sell / total > 0.40:
+            label = "Sell"
+        else:
+            label = "Mixed"
 
-    if to_col is None:
-        logger.debug("upgrades_downgrades missing 'To Grade' column; skipping consensus.")
-        return empty
+    if label is not None and total > 0:
+        result["consensus_label"] = label
 
-    now      = pd.Timestamp.now()
-    cut_90   = now - pd.Timedelta(days=90)
-    cut_30   = now - pd.Timedelta(days=30)
+    return result
 
-    recent_90 = df[df.index >= cut_90]
-    recent_30 = df[df.index >= cut_30]
 
-    # Count buy / hold / sell in last 90 days
-    buy_count = hold_count = sell_count = 0
-    for grade in recent_90[to_col].dropna():
-        mapped = _map_grade(str(grade))
-        if mapped == "buy":
-            buy_count += 1
-        elif mapped == "hold":
-            hold_count += 1
-        elif mapped == "sell":
-            sell_count += 1
+def _trend_counts(trend) -> dict | None:
+    """Buy/hold/sell counts from the most recent recommendationTrend period."""
+    if trend is None or (hasattr(trend, "empty") and trend.empty):
+        return None
+    try:
+        df = trend
+        cols = {c.lower(): c for c in df.columns}
+        needed = ("strongbuy", "buy", "hold", "sell", "strongsell")
+        if not all(c in cols for c in needed):
+            logger.debug("recommendationTrend missing expected columns: %s", list(df.columns))
+            return None
 
-    total = buy_count + hold_count + sell_count
+        # Prefer the current period ("0m"); fall back to the first available row.
+        row = None
+        if "period" in cols:
+            match = df[df[cols["period"]].astype(str).str.strip() == "0m"]
+            if not match.empty:
+                row = match.iloc[0]
+        if row is None:
+            row = df.iloc[0]
 
-    # Upgrades / downgrades in last 30 days
-    recent_upgrades = recent_downgrades = 0
-    if from_col is not None:
+        def _n(name):
+            v = row[cols[name]]
+            return 0 if pd.isna(v) else int(v)
+
+        buy  = _n("strongbuy") + _n("buy")
+        hold = _n("hold")
+        sell = _n("sell") + _n("strongsell")
+        total = buy + hold + sell
+        if total == 0:
+            return None
+
+        return {
+            "analyst_count": total,
+            "buy_count":     buy,
+            "hold_count":    hold,
+            "sell_count":    sell,
+        }
+    except Exception as exc:
+        logger.debug("recommendationTrend parse error: %s", exc)
+        return None
+
+
+def _rating_momentum(changes) -> dict:
+    """Upgrades / downgrades in the last 30 days from the rating-change log."""
+    out = {"recent_upgrades": 0, "recent_downgrades": 0}
+    if changes is None or (hasattr(changes, "empty") and changes.empty):
+        return out
+    try:
+        df = changes.copy()
+        if hasattr(df.index, "tz") and df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+
+        # yfinance uses "ToGrade"/"FromGrade" or "To Grade"/"From Grade" by version.
+        col_map  = {c.lower().replace(" ", "").replace("_", ""): c for c in df.columns}
+        to_col   = col_map.get("tograde")
+        from_col = col_map.get("fromgrade")
+        if to_col is None or from_col is None:
+            return out
+
+        recent_30 = df[df.index >= pd.Timestamp.now() - pd.Timedelta(days=30)]
         for _, row in recent_30.iterrows():
-            to   = _map_grade(str(row[to_col]   if to_col   in row.index else ""))
-            frm  = _map_grade(str(row[from_col] if from_col in row.index else ""))
+            to  = _map_grade(str(row[to_col]))
+            frm = _map_grade(str(row[from_col]))
             if to == "buy" and frm in ("hold", "sell"):
-                recent_upgrades += 1
+                out["recent_upgrades"] += 1
             elif to in ("hold", "sell") and frm == "buy":
-                recent_downgrades += 1
-
-    # Consensus label
-    if total < 3:
-        label = "Insufficient Data"
-    elif buy_count / total > 0.70:
-        label = "Strong Buy"
-    elif buy_count / total > 0.50:
-        label = "Buy"
-    elif hold_count / total > 0.50:
-        label = "Hold"
-    elif sell_count / total > 0.40:
-        label = "Sell"
-    else:
-        label = "Mixed"
-
-    return {
-        "analyst_count":     total,
-        "buy_count":         buy_count,
-        "hold_count":        hold_count,
-        "sell_count":        sell_count,
-        "recent_upgrades":   recent_upgrades,
-        "recent_downgrades": recent_downgrades,
-        "consensus_label":   label,
-    }
+                out["recent_downgrades"] += 1
+        return out
+    except Exception as exc:
+        logger.debug("rating momentum parse error: %s", exc)
+        return out
 
 
 # ---------------------------------------------------------------------------

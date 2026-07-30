@@ -11,7 +11,6 @@ Public API:
     price_chart(history, symbol)                -> BytesIO
     rsi_chart(history, symbol)                  -> BytesIO
     forecast_chart(current, forecast_data, sym) -> BytesIO
-    returns_bar_chart(returns_dict, symbol)      -> BytesIO
     dividend_history_chart(history, symbol)      -> BytesIO
     sector_pie_chart(sector_weights, symbol)     -> BytesIO
     portfolio_allocation_pie(picks)              -> BytesIO
@@ -36,7 +35,13 @@ import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
 
+from recommendations.engine import _band_for_risk
+
 logger = logging.getLogger(__name__)
+
+# Max height in inches for universe_risk_bar — keeps the figure inside the PDF frame
+# even for an 85-ticker universe.
+_RISK_BAR_MAX_H = 8.0
 
 # ---------------------------------------------------------------------------
 # §16.1  Color palette
@@ -70,8 +75,13 @@ plt.rcParams.update({
 # ---------------------------------------------------------------------------
 
 def _fig_to_bytes(fig) -> io.BytesIO:
+    # Every chart reserves its own space (tight_layout, or subplots_adjust for the
+    # pies), so bbox_inches="tight" was a redundant extra layout pass. Omitting it
+    # also bounds the raster to the figure size — a stray off-canvas artist can no
+    # longer inflate the saved image. Charts with an outside-axes legend must keep
+    # their labels short; see _trim_label.
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=80, bbox_inches="tight")
+    fig.savefig(buf, format="png", dpi=80)
     plt.close(fig)
     buf.seek(0)
     return buf
@@ -79,6 +89,16 @@ def _fig_to_bytes(fig) -> io.BytesIO:
 
 def _new_fig(w=8, h=3):
     return plt.subplots(figsize=(w, h))
+
+
+# Legends anchored outside the axes only have the width reserved by
+# subplots_adjust(right=0.68); ~40 chars is what fits at fontsize 8.
+_LABEL_MAX = 38
+
+
+def _trim_label(text: str) -> str:
+    text = str(text)
+    return text if len(text) <= _LABEL_MAX else text[:_LABEL_MAX - 1] + "…"
 
 
 def _pct_fmt(x, _):
@@ -178,14 +198,17 @@ def forecast_chart(current: float, forecast_data: dict, symbol: str) -> io.Bytes
             ax.plot(x, [current, forecast_3m], color=color, linewidth=2,
                     marker="o", markersize=7, zorder=3)
 
-            # Analyst high/low band
+            # 12-month analyst high/low, drawn at its true absolute levels and
+            # offset from the 3-month point. Previously this was an error bar
+            # centred on the 3-month forecast, so max(0.0, ...) silently collapsed
+            # a whisker whenever the projection fell outside the analyst range —
+            # hiding exactly the disagreement worth seeing.
             if forecast_high is not None and forecast_low is not None:
-                lower = max(0.0, forecast_3m - forecast_low)
-                upper = max(0.0, forecast_high - forecast_3m)
-                ax.errorbar(1, forecast_3m,
-                            yerr=[[lower], [upper]],
-                            fmt="none", color=C_BLUE, capsize=6,
-                            linewidth=1.2, alpha=0.7, label="Analyst range")
+                ax.vlines(1.18, forecast_low, forecast_high,
+                          color=C_BLUE, linewidth=1.4, alpha=0.75,
+                          label="12m analyst range")
+                for y in (forecast_low, forecast_high):
+                    ax.hlines(y, 1.13, 1.23, color=C_BLUE, linewidth=1.4, alpha=0.75)
 
             upside = (forecast_3m / current - 1) * 100
             ax.annotate(f"${forecast_3m:,.2f}\n({upside:+.1f}%)",
@@ -202,56 +225,14 @@ def forecast_chart(current: float, forecast_data: dict, symbol: str) -> io.Bytes
         ax.set_xlim(-0.3, 1.5)
         ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"${v:,.0f}"))
         ax.set_ylabel(f"{symbol} Price")
-        ax.legend(fontsize=8, frameon=False)
+        # Upper-left: the analyst range bar occupies the right side.
+        ax.legend(fontsize=8, frameon=False, loc="upper left")
         fig.tight_layout()
     except Exception as exc:
         logger.warning("forecast_chart(%s): %s", symbol, exc)
         ax.text(0.5, 0.5, "Chart unavailable", ha="center", va="center",
                 transform=ax.transAxes, color=C_DTEXT)
     return _fig_to_bytes(fig)
-
-
-# ---------------------------------------------------------------------------
-# returns_bar_chart  §15
-# ---------------------------------------------------------------------------
-
-def returns_bar_chart(returns_dict: dict, symbol: str) -> io.BytesIO:
-    """Bars for 1m/3m/1y/3y/5y; green positive, red negative. Size 8×3."""
-    fig, ax = _new_fig(8, 3)
-    try:
-        periods = [
-            ("1M",  returns_dict.get("return_1m")),
-            ("3M",  returns_dict.get("return_3m")),
-            ("1Y",  returns_dict.get("return_1y")),
-            ("3Y",  returns_dict.get("return_3y")),
-            ("5Y",  returns_dict.get("return_5y")),
-        ]
-        labels = [p[0] for p in periods if p[1] is not None]
-        values = [p[1] for p in periods if p[1] is not None]
-
-        if not values:
-            raise ValueError("No return data")
-
-        colors = [C_GREEN if v >= 0 else C_RED for v in values]
-        bars = ax.bar(labels, values, color=colors, width=0.5, zorder=2)
-
-        for bar, val in zip(bars, values):
-            y_pos = val + (0.003 if val >= 0 else -0.003)
-            va    = "bottom" if val >= 0 else "top"
-            ax.text(bar.get_x() + bar.get_width() / 2, y_pos,
-                    f"{val:.1%}", ha="center", va=va, fontsize=8, color=C_DTEXT)
-
-        ax.axhline(0, color="#AAAAAA", linewidth=0.8)
-        ax.yaxis.set_major_formatter(mticker.FuncFormatter(_pct_fmt))
-        ax.set_ylabel("Return")
-        ax.grid(axis="y", linestyle=":", alpha=0.4)
-        fig.tight_layout()
-    except Exception as exc:
-        logger.warning("returns_bar_chart(%s): %s", symbol, exc)
-        ax.text(0.5, 0.5, "No return data", ha="center", va="center",
-                transform=ax.transAxes, color=C_DTEXT)
-    return _fig_to_bytes(fig)
-
 
 # ---------------------------------------------------------------------------
 # dividend_history_chart  §15
@@ -264,13 +245,17 @@ def dividend_history_chart(history: dict, symbol: str) -> io.BytesIO:
         if not history:
             raise ValueError("No dividend history")
 
-        labels = list(history.keys())
+        # str() keeps the axis categorical. Annual history is keyed by int year
+        # (fundamentals._dividend_history_annual), which would otherwise place the
+        # bars at x≈2021–2025 while the labels below sat at x=0..4.
+        labels = [str(k) for k in history.keys()]
         values = [float(v) if v is not None else 0.0 for v in history.values()]
 
-        ax.bar(labels, values, color=C_BLUE, width=0.5, zorder=2)
-        for i, (label, val) in enumerate(zip(labels, values)):
+        bars = ax.bar(labels, values, color=C_BLUE, width=0.5, zorder=2)
+        offset = max(values) * 0.02
+        for bar, val in zip(bars, values):
             if val > 0:
-                ax.text(i, val + max(values) * 0.02, f"${val:.2f}",
+                ax.text(bar.get_x() + bar.get_width() / 2, val + offset, f"${val:.2f}",
                         ha="center", va="bottom", fontsize=7.5, color=C_DTEXT)
 
         ax.set_ylabel("Dividends / Distributions ($)")
@@ -321,7 +306,7 @@ def sector_pie_chart(sector_weights: dict, symbol: str) -> io.BytesIO:
         for at in autotexts:
             at.set_fontsize(7.5)
 
-        ax.legend(wedges, labels, loc="center left",
+        ax.legend(wedges, [_trim_label(l) for l in labels], loc="center left",
                   bbox_to_anchor=(1, 0.5), fontsize=8, frameon=False)
         ax.set_aspect("equal")
         fig.subplots_adjust(right=0.68)
@@ -378,8 +363,9 @@ def portfolio_allocation_pie(picks: list) -> io.BytesIO:
 
 def universe_risk_bar(all_scores: dict, user_risk: int) -> io.BytesIO:
     """Horizontal bars for all tickers color-coded vs user's risk band. Size 8×3."""
-    from recommendations.engine import _band_for_risk
-    fig, ax = _new_fig(8, max(3, len(all_scores) * 0.28))
+    # Capped so an 85-ticker universe doesn't produce a 24 in tall figure that
+    # overflows the PDF frame.
+    fig, ax = _new_fig(8, min(_RISK_BAR_MAX_H, max(3, len(all_scores) * 0.28)))
     try:
         if not all_scores:
             raise ValueError("No scores")

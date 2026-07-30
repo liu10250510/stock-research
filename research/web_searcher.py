@@ -40,6 +40,16 @@ except ImportError:
 # Site clusters
 # ---------------------------------------------------------------------------
 
+# Politeness delay applied per real network query (never on a cache hit).
+_QUERY_DELAY = 0.5
+
+# One pooled session for the HTTP fallback — avoids a fresh TCP+TLS handshake
+# per query. requests.Session is thread-safe for plain GETs.
+_SESSION = requests.Session()
+_SESSION.headers.update(
+    {"User-Agent": "Mozilla/5.0 (compatible; StockResearch/1.0)"}
+)
+
 _SITES_ANALYST  = "site:marketbeat.com OR site:zacks.com OR site:seekingalpha.com"
 _SITES_NEWS     = "site:reuters.com OR site:finance.yahoo.com"
 _SITES_RETAIL   = "site:fool.com OR site:simplywall.st"
@@ -101,9 +111,9 @@ def search_ticker(symbol: str, name: str) -> dict:
     try:
         queries = _build_queries(symbol, name)
         results = []
-        for i, q in enumerate(queries):
-            if i > 0:
-                time.sleep(0.5)
+        for q in queries:
+            # Politeness delay lives inside _run_query, after the cache check,
+            # so warm-cache runs don't sleep for nothing.
             results.extend(_run_query(q))
 
         if not results:
@@ -229,6 +239,9 @@ def _run_query(query: str) -> list:
             logger.debug("Cache hit for query: %s", query[:60])
             return cached
 
+    # Only real network calls pay the politeness delay.
+    time.sleep(_QUERY_DELAY)
+
     results: list = []
     try:
         results = _search_ddgs(query)
@@ -241,7 +254,9 @@ def _run_query(query: str) -> list:
         except Exception as exc:
             logger.warning("Both search methods failed for query: %s — %s", query[:60], exc)
 
-    if results and _cache is not None:
+    # Empty results are cached too — otherwise a query that legitimately returns
+    # nothing is re-run in full on every future run, forever.
+    if _cache is not None:
         _cache.put(query, results)
 
     return results
@@ -257,10 +272,9 @@ def _search_ddgs(query: str) -> list:
 
 
 def _search_http(query: str) -> list:
-    resp = requests.get(
+    resp = _SESSION.get(
         "https://html.duckduckgo.com/html/",
         params={"q": query},
-        headers={"User-Agent": "Mozilla/5.0 (compatible; StockResearch/1.0)"},
         timeout=10,
     )
     resp.raise_for_status()
