@@ -324,6 +324,18 @@ def compute_performance(req: PerformanceRequest):
     return {"results": results, "skipped": skipped}
 
 
+@app.get("/api/market-summary")
+def market_summary(refresh: bool = False):
+    """Day / week / month market recap. Instant — no job, no PDF.
+
+    Cold (empty caches) this blocks a worker for several seconds while it fetches
+    index history and runs the news queries; warm it is milliseconds.
+    ?refresh=1 bypasses both the 15-minute market cache and the search cache.
+    """
+    from analysis.market_summary import fetch_market_summary
+    return fetch_market_summary(use_cache=not refresh)
+
+
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str):
     job = JOBS.get(job_id)

@@ -2,11 +2,16 @@ import { useState } from 'react'
 import ConfigForm from './components/ConfigForm'
 import CustomSymbolsForm from './components/CustomSymbolsForm'
 import PerformanceAnalysisForm from './components/PerformanceAnalysisForm'
+import MarketSummaryPanel from './components/MarketSummaryPanel'
 import ProgressPanel from './components/ProgressPanel'
 import DownloadButton from './components/DownloadButton'
 import { useJobStream } from './hooks/useJobStream'
 
-type Tab = 'portfolio' | 'custom' | 'performance'
+type Tab = 'portfolio' | 'custom' | 'performance' | 'market'
+
+// Tabs that run a background job and therefore show the progress panel and the
+// download button. The others are instant endpoints with nothing to stream.
+const JOB_TABS: Tab[] = ['portfolio', 'custom']
 
 function TabButton({
   active, onClick, children,
@@ -46,7 +51,7 @@ export default function App() {
 
   return (
     <div className="min-h-screen py-10 px-4" style={{ background: '#F0F4F8' }}>
-      <div className="max-w-2xl mx-auto">
+      <div className={`mx-auto ${activeTab === 'market' ? 'max-w-3xl' : 'max-w-2xl'}`}>
 
         {/* Header */}
         <div className="flex items-center justify-between mb-10">
@@ -88,6 +93,9 @@ export default function App() {
           <TabButton active={activeTab === 'performance'} onClick={() => switchTab('performance')}>
             Performance Analysis
           </TabButton>
+          <TabButton active={activeTab === 'market'} onClick={() => switchTab('market')}>
+            Market Summary
+          </TabButton>
         </div>
 
         {/* Card */}
@@ -98,12 +106,13 @@ export default function App() {
           {activeTab === 'portfolio' && <ConfigForm onJobStarted={handleJobStarted} disabled={isRunning} />}
           {activeTab === 'custom' && <CustomSymbolsForm onJobStarted={handleJobStarted} disabled={isRunning} />}
           {activeTab === 'performance' && <PerformanceAnalysisForm />}
+          {activeTab === 'market' && <MarketSummaryPanel />}
 
-          {activeTab !== 'performance' && jobId && (
+          {JOB_TABS.includes(activeTab) && jobId && (
             <ProgressPanel lines={lines} status={status} error={error} />
           )}
 
-          {activeTab !== 'performance' && status === 'done' && jobId && (
+          {JOB_TABS.includes(activeTab) && status === 'done' && jobId && (
             <DownloadButton jobId={jobId} filename={filename} />
           )}
         </div>

@@ -92,21 +92,23 @@ def _rsi(close: pd.Series, period: int = 14) -> dict:
 # exchange and holiday calendar, so a fixed count is fragile: the old 1260-day
 # lookback for 5y was unreachable from a period="5y" fetch (which returns ~1254
 # bars), making return_5y None for every ticker on every report.
+# Each period carries its own as-of tolerance — how far before the target date a
+# bar may sit and still be accepted. One shared value doesn't work: 10 days is
+# right for a 5-year lookback but would let a "1 day" return silently measure a
+# week and a half.
 _RETURN_PERIODS = [
-    ("return_1m",  pd.DateOffset(months=1)),
-    ("return_3m",  pd.DateOffset(months=3)),
-    ("return_1y",  pd.DateOffset(years=1)),
-    ("return_3y",  pd.DateOffset(years=3)),
-    ("return_5y",  pd.DateOffset(years=5)),
+    ("return_1d",  pd.DateOffset(days=1),    pd.Timedelta(days=4)),   # absorbs a long weekend
+    ("return_1w",  pd.DateOffset(weeks=1),   pd.Timedelta(days=5)),
+    ("return_1m",  pd.DateOffset(months=1),  pd.Timedelta(days=10)),
+    ("return_3m",  pd.DateOffset(months=3),  pd.Timedelta(days=10)),
+    ("return_1y",  pd.DateOffset(years=1),   pd.Timedelta(days=10)),
+    ("return_3y",  pd.DateOffset(years=3),   pd.Timedelta(days=10)),
+    ("return_5y",  pd.DateOffset(years=5),   pd.Timedelta(days=10)),
 ]
-
-# How far before the target date we'll accept a bar, to absorb weekends/holidays
-# without silently reporting a materially shorter period.
-_ASOF_TOLERANCE = pd.Timedelta(days=10)
 
 
 def _returns(close: pd.Series) -> dict:
-    result = {key: None for key, _ in _RETURN_PERIODS}
+    result = {key: None for key, _, _ in _RETURN_PERIODS}
     if close.empty or not isinstance(close.index, pd.DatetimeIndex):
         return result
 
@@ -115,10 +117,10 @@ def _returns(close: pd.Series) -> dict:
     last      = float(close.iloc[-1])
     first     = close.index[0]
 
-    for key, offset in _RETURN_PERIODS:
+    for key, offset, tolerance in _RETURN_PERIODS:
         target = last_date - offset
         # Not enough history to cover this period at all.
-        if target < first - _ASOF_TOLERANCE:
+        if target < first - tolerance:
             continue
 
         idx = close.index.asof(target)
@@ -127,7 +129,7 @@ def _returns(close: pd.Series) -> dict:
             # a day or two after the exact 5-year mark. Within tolerance, measure
             # from the earliest bar we have rather than reporting nothing.
             idx = first
-        elif target - idx > _ASOF_TOLERANCE:
+        elif target - idx > tolerance:
             # Nearest earlier bar is far older than asked for.
             continue
 

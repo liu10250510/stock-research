@@ -52,3 +52,93 @@ export interface PerformanceResponse {
   results: PerformanceMetrics[]
   skipped: string[]
 }
+
+export interface MarketMove {
+  symbol: string
+  name: string
+  group: string
+  kind: string
+  /** "pct" → read `return`; "level" → read `change` (a yield/VIX move is not a return). */
+  unit: 'pct' | 'level'
+  level: number | null
+  return: number | null
+  change: number | null
+}
+
+export interface MarketHeadline {
+  snippet: string
+  url: string
+  domain: string
+  sentiment_label: string
+}
+
+export interface SectorRow {
+  symbol: string
+  sector: string
+  market: 'US' | 'Canada'
+  style: 'cyclical' | 'defensive' | 'sensitive'
+  return: number
+}
+
+export interface SectorLeader {
+  sector: string
+  market: string
+  return: number
+}
+
+export interface SectorDivergence {
+  sector: string
+  canada: number
+  us: number
+  gap: number
+}
+
+/** Every field here records what already happened — none of it is a forecast. */
+export interface TrendSignals {
+  leaders: SectorLeader[]
+  laggards: SectorLeader[]
+  breadth: number | null
+  breadth_label: string | null
+  risk_spread: number | null
+  risk_label: string | null
+  divergences: SectorDivergence[]
+  meaningful_count: number
+}
+
+export interface CrossTrendItem {
+  sector: string
+  market: string
+  returns?: Record<string, number>
+  short?: number
+  month?: number
+}
+
+export interface CrossWindowTrends {
+  sustained_strength: CrossTrendItem[]
+  sustained_weakness: CrossTrendItem[]
+  rotating_in: CrossTrendItem[]
+  rotating_out: CrossTrendItem[]
+}
+
+export interface MarketWindow {
+  label: string
+  sectors: SectorRow[]
+  trends: TrendSignals
+  moves: Record<string, MarketMove>
+  narrative: string | null
+  /** Which engine wrote `narrative` — surfaced in the UI so readers know. */
+  summarizer: 'claude' | 'extractive' | null
+  headlines: MarketHeadline[]
+  sources: string[]
+  sentiment_score: number
+  sentiment_label: string
+  /** True when no usable news came back; show the moves, not a fabricated story. */
+  data_unavailable: boolean
+}
+
+export interface MarketSummary {
+  as_of: string
+  windows: Record<string, MarketWindow>
+  cross_window_trends: CrossWindowTrends
+  errors: string[]
+}
