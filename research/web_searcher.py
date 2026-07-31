@@ -227,13 +227,16 @@ def _build_queries(symbol: str, name: str) -> list:
 # Search execution
 # ---------------------------------------------------------------------------
 
-def _run_query(query: str) -> list:
+def _run_query(query: str, use_cache: bool = True) -> list:
     """Return search results for query, using cache when available.
 
     Cache hit → return immediately (stable across runs within 24 h).
     Cache miss → try DDGS, fall back to HTTP, then persist the result.
+
+    use_cache=False skips the read but still writes, so a caller forcing a
+    refresh repopulates the cache for everyone else.
     """
-    if _cache is not None:
+    if use_cache and _cache is not None:
         cached = _cache.get(query)
         if cached is not None:
             logger.debug("Cache hit for query: %s", query[:60])

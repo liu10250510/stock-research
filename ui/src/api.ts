@@ -1,4 +1,4 @@
-import type { JobParams, CustomJobParams, PerformanceResponse } from './types'
+import type { JobParams, CustomJobParams, PerformanceResponse, MarketSummary } from './types'
 
 const BASE = '/api'
 
@@ -52,6 +52,18 @@ export async function getPerformanceMetrics(symbols: string[]): Promise<Performa
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ symbols }),
   })
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({ detail: 'Unknown error' }))
+    const detail = Array.isArray(err.detail)
+      ? err.detail.map((e: { msg: string }) => e.msg).join('; ')
+      : String(err.detail ?? 'Unknown error')
+    throw new Error(detail)
+  }
+  return r.json()
+}
+
+export async function getMarketSummary(refresh = false): Promise<MarketSummary> {
+  const r = await fetch(`${BASE}/market-summary${refresh ? '?refresh=1' : ''}`)
   if (!r.ok) {
     const err = await r.json().catch(() => ({ detail: 'Unknown error' }))
     const detail = Array.isArray(err.detail)

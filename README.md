@@ -13,6 +13,10 @@ A Python tool that fetches live market data, scores stocks on a 1–10 risk scal
 - **Portfolio scenario analysis** — crash / rate hike / bull run / recession stress tests
 - **3-month price forecasts** — analyst target model + momentum model
 - **Canadian platform fee estimates** — Questrade, Wealthsimple, Major banks (TD Direct Investing)
+- **Market summary** — day / week / month sector analysis across 21 US and Canadian sector ETFs,
+  with trend signals (leadership, rotation, breadth, cyclical-vs-defensive tilt, Canada/US
+  divergence), index/commodity/rate/FX backdrop, and a news-driven narrative (web UI tab).
+  Signals describe what has already happened; they are not forecasts.
 
 ## Project layout
 
@@ -111,9 +115,13 @@ API endpoints:
 | `GET` | `/api/jobs/{id}` | Poll job status and log |
 | `GET` | `/api/jobs/{id}/stream` | SSE live log stream |
 | `GET` | `/api/jobs/{id}/report` | Download generated PDF |
+| `GET` | `/api/market-summary` | Day / week / month market recap (`?refresh=1` to bypass caches) |
 
 ## Data sources
 
 - **Market data**: [yfinance](https://github.com/ranaroussi/yfinance) (Yahoo Finance) — free, no API key
 - **Web research**: DuckDuckGo HTML search via `requests` + `BeautifulSoup` — free, no API key
+- **Market summary narrative** *(optional)*: Claude, used only when `ANTHROPIC_API_KEY` is set or an
+  `ant auth login` profile exists. Without credentials the summary still works — it falls back to a
+  deterministic extractive digest, and the UI labels which engine produced each window.
 - Prices are delayed ~15 minutes; noted on the report cover page

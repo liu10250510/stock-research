@@ -10,3 +10,9 @@ fastapi>=0.111.0
 uvicorn[standard]>=0.29.0
 python-multipart>=0.0.9
 aiofiles>=23.0.0
+
+# Optional — enables LLM-written market summaries. The runtime gate is the
+# *credential* (ANTHROPIC_API_KEY or an `ant auth login` profile), not the
+# package: with the package installed but no credentials, the market summary
+# falls back to its extractive engine rather than failing.
+anthropic>=0.70
